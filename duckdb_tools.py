@@ -50,56 +50,29 @@ _DEFAULT_DB_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "stock_data.duckdb"
 )
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 单例连接管理器
-# ─────────────────────────────────────────────────────────────────────────────
 
-class _ConnectionManager:
-    """
-    线程安全的 DuckDB 单例连接管理器。
-
-    DuckDB 在同一进程内可共享同一个 in-process 连接，不需要连接池。
-    此类保证全局只创建一个连接，并在首次访问时自动建表。
-    """
-
-    _instance: Optional["_ConnectionManager"] = None
-    _lock: threading.Lock = threading.Lock()
-
-    def __new__(cls, db_path: str = _DEFAULT_DB_PATH) -> "_ConnectionManager":
-        with cls._lock:
-            if cls._instance is None:
-                obj = super().__new__(cls)
-                obj._db_path = db_path # type: ignore
-                obj._conn: Optional[duckdb.DuckDBPyConnection] = None # type: ignore
-                cls._instance = obj
-            return cls._instance
-
-    @property
-    def conn(self) -> duckdb.DuckDBPyConnection:
-        if self._conn is None:
-            self._conn = duckdb.connect(self._db_path) # type: ignore
-            logger.info(f"DuckDB 已连接: {self._db_path}") # type: ignore
-            _ensure_tables(self._conn)
-        return self._conn
-
-    def close(self) -> None:
-        if self._conn is not None:
-            self._conn.close()
-            self._conn = None
-            logger.info("DuckDB 连接已关闭")
+def _open(db_path: str, readonly: bool = False) -> duckdb.DuckDBPyConnection:
+    """打开 DuckDB 连接（短连接，调用方负责关闭）。"""
+    global _tables_initialized
+    conn = duckdb.connect(db_path, read_only=False)
+    return conn
 
 
 def get_connection(db_path: str = _DEFAULT_DB_PATH) -> duckdb.DuckDBPyConnection:
     """
-    获取全局 DuckDB 连接（惰性初始化，首次调用建表）。
+    获取 DuckDB 读写连接（短连接模式）。
 
-    参数:
-        db_path: 数据库文件路径，默认与本模块同目录下的 stock_data.duckdb
-
-    返回:
-        duckdb.DuckDBPyConnection
+    注意：调用方应在操作完成后及时释放（依赖 context manager 或 GC），
+    不要长期持有，以免多进程写锁冲突。
     """
-    return _ConnectionManager(db_path).conn
+    return _open(db_path, readonly=False)
+
+
+def get_read_connection(db_path: str = _DEFAULT_DB_PATH) -> duckdb.DuckDBPyConnection:
+    """
+    获取 DuckDB 只读连接（不持有写锁，可多进程并发）。
+    """
+    return _open(db_path, readonly=True)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 建表 DDL
@@ -301,7 +274,7 @@ def get_stock_info(
         df = get_stock_info('sh.600519')
         print(df)
     """
-    conn = get_connection(db_path)
+    conn = get_read_connection(db_path)
     if code:
         return conn.execute("SELECT * FROM stock_info WHERE code = ?", [code]).df()
     res = conn.execute("SELECT * FROM stock_info ORDER BY code").df()
@@ -444,9 +417,9 @@ def get_daily(
 
         df = get_daily('sh.600519', '贵州茅台', '2025-01-01', '2026-04-17')
         print(df.tail())
-    """
-    conn = get_connection(db_path)
+    """ 
     stk_info = get_stock_info(code)
+    conn = get_read_connection(db_path)
     code_name = stk_info['code_name'].values[0]
 
     def _query_local() -> pd.DataFrame:
@@ -608,9 +581,8 @@ def query_daily(
             params=['2026-04-17']
         )
     """
-    conn = get_connection(db_path)
+    conn = get_read_connection(db_path)
     res = conn.execute(sql, params or []).df()
-    conn.close()
     return res
 
 
@@ -824,7 +796,7 @@ def table_stats(db_path: str = _DEFAULT_DB_PATH) -> pd.DataFrame:
 
         print(table_stats())
     """
-    conn = get_connection(db_path)
+    conn = get_read_connection(db_path)
     rows = []
 
     for tbl, date_col in [
@@ -841,13 +813,9 @@ def table_stats(db_path: str = _DEFAULT_DB_PATH) -> pd.DataFrame:
         else:
             min_d = max_d = None
         rows.append({"table": tbl, "rows": count, "min_date": min_d, "max_date": max_d})
-    conn.close()
     return pd.DataFrame(rows)
 
 
-def close_db(db_path: str = _DEFAULT_DB_PATH) -> None:
-    """关闭数据库连接（程序退出前调用）。"""
-    _ConnectionManager(db_path).close()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -907,5 +875,4 @@ if __name__ == "__main__":
     print("\n===== 测试 7: table_stats =====")
     print(table_stats().to_string())
 
-    close_db()
     print("\n所有测试完成")

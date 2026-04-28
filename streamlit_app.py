@@ -28,6 +28,11 @@ if dc.is_alive():
     st.sidebar.success("🟢 守护进程在线")
 else:
     st.sidebar.warning("🔴 守护进程离线")
+if st.sidebar.button('链接守护进程'):
+    if dc.is_alive():
+        st.sidebar.success("🟢 守护进程在线")
+    else:
+        st.sidebar.warning("🔴 守护进程离线")
 
 
 # ─── 侧边栏：数据库状态 ───
