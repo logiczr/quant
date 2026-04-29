@@ -252,6 +252,25 @@ elif page == "🔧 数据库维护":
                     st.toast(f"✅ {task_id} 已触发")
                 else:
                     st.toast(f"❌ {task_id} 触发失败：{result.get('detail', result.get('error', '未知'))}")
+    
+    st.subheader("最近拉取记录")
+    last_fetch = dc.get_last_fetch()
+    if last_fetch:
+        # 把 failed_codes 列表转成可读字符串
+        display = {}
+        for k, v in last_fetch.items():
+            if k == "failed_codes":
+                display[k] = f"{len(v)} 只" if v else "无"
+            else:
+                display[k] = v
+        st.dataframe(
+            pd.DataFrame([{"字段": k, "值": v} for k, v in display.items()]),
+            use_container_width=True,
+            hide_index=True,
+        )
+    else:
+        st.info("暂无拉取记录")
+
 
 elif page == "📈 因子分析":
     st.title("策略看板")
@@ -259,7 +278,7 @@ elif page == "📈 因子分析":
     # 加载策略列表
     strategies = se.list_strategies()
     if not strategies:
-        st.warning("strategies/ 目录下没有策略定义文件")
+        st.warning("strategy/ 目录下没有策略定义文件")
         st.stop()
 
     # 策略选择
@@ -292,50 +311,11 @@ elif page == "📈 因子分析":
                 f"日期范围: {info.get('date_range', '无')}"
             )
 
-    # ── screener 类型：动态条件 UI ──
-    if selected.get("type") == "screener":
-        fields_def = {f["name"]: f for f in selected.get("fields", [])}
-        filterable_fields = [f for f in selected.get("fields", []) if f.get("filterable", False)]
-
-        # 筛选条件
-        st.subheader("筛选条件")
-        default_filters = selected.get("default_filters", [])
-
-        # 用 session_state 存条件列表
-        if "screener_filters" not in st.session_state:
-            st.session_state.screener_filters = list(default_filters)
-
-        # 显示当前条件
-        filters_to_remove = []
-        for i, f in enumerate(st.session_state.screener_filters):
-            col1, col2, col3, col4 = st.columns([3, 1, 3, 1])
-            with col1:
-                field_options = {ff["name"]: ff["label"] for ff in filterable_fields}
-                current_field = st.selectbox(
-                    "字段",
-                    list(field_options.keys()),
-                    index=list(field_options.keys()).index(f["field"]) if f["field"] in field_options else 0,
-                    key=f"filter_field_{i}",
-                    format_func=lambda x: field_options.get(x, x),
-                )
-                st.session_state.screener_filters[i]["field"] = current_field
-            with col2:
-                op = st.selectbox(
-                    "条件",
-                    [">", ">=", "<", "<=", "=", "!="],
-                    index=[">", ">=", "<", "<=", "=", "!="].index(f.get("op", ">")),
-                    key=f"filter_op_{i}",
-                )
-                st.session_state.screener_filters[i]["op"] = op
-            with col3:
-                value = st.number_input(
-                    "值",
-                    value=float(f.get("value", 0)),
-                    key=f"filter_value_{i}",
-                    format="%f",
-                )
-                st.session_state.screener_filters[i]["value"] = value
-            with col4:
-                if st.button("🗑", key=f"filter_del_{i}"):
-                    filters_to_remove.append(i)
-
+    if st.button("查询"):
+        df = se.query_strategy(
+            selected["name"],
+            date=date_str
+        )
+        st.dataframe(df, use_container_width=True, height=600)
+    else:
+        st.info("请先选择日期")

@@ -380,6 +380,9 @@ def get_result(task_id: str):
         return {"task_id": task_id, "status": "pending", "result": None}
     return {"task_id": task_id, "status": "DONE", "result": r}
 
+@app.get("/last_fetch")
+def get_last_fetch():
+    return _load_last_fetch()
 
 # ── 入口 ──────────────────────────────────────────────────────────────────
 

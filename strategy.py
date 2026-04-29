@@ -4,23 +4,26 @@ strategy.py — 策略引擎 + 计算函数
 职责：
   - 加载 strategies/ 目录下的 JSON 策略定义
   - 注册 Python 计算函数（_COMPUTE_FUNCS 注册表）
-  - 查询时：检查策略表有无数据 → 无则触发计算 → 返回结果
+  - 查询时：检查 last_date → 有缓存直接返回 → 无则计算写表 → 更新 last_date
   - 支持两种计算模式：Python 函数 / 纯 SQL
   - Screener：动态条件选股（type=screener，无持久化）
 
-策略 JSON 格式（compute 不再需要 module/function）：
+策略 JSON 格式：
   {
     "name": "策略名",
     "description": "描述",
-    "version": 1,
     "table": "strategy_xxx",
-    "schema": "CREATE TABLE IF NOT EXISTS strategy_xxx (...)",
-    "dependencies": ["daily_bar"],
-    "compute": {
-      "type": "python" | "sql" | "none"
-    },
-    "query": "SELECT * FROM strategy_xxx WHERE date = ? ORDER BY rank",
-    "params": { ... }
+    "columns": [
+      {"name": "code", "type": "VARCHAR", "not_null": true},
+      {"name": "date", "type": "DATE", "not_null": true},
+      ...
+    ],
+    "primary_key": ["code", "date"],
+    "compute": {"type": "python", "function": "func_name"},
+    "write_sql": "仅供参考，引擎不读取",
+    "read_sql": "SELECT * FROM strategy_xxx WHERE date = ? ORDER BY rank",
+    "params": { ... },
+    "last_date": ""
   }
 
 依赖：
@@ -50,10 +53,10 @@ logger = logging.getLogger("strategy")
 # 策略目录 + 注册表
 # ─────────────────────────────────────────────────────────────────────────────
 
-_STRATEGIES_DIR = Path(__file__).parent / "strategies"
+_STRATEGIES_DIR = Path(__file__).parent / "strategy"
 
 # 策略名 → Python 计算函数
-# 注册方式：@register_compute("策略名") 或 _COMPUTE_FUNCS["策略名"] = func
+# 注册方式：@register_compute("策略名")
 _COMPUTE_FUNCS: dict[str, Callable] = {}
 
 
@@ -71,12 +74,7 @@ def register_compute(name: str):
 # ═════════════════════════════════════════════════════════════════════════════
 
 def list_strategies() -> list[dict]:
-    """
-    扫描 strategies/ 目录，返回所有策略定义列表。
-
-    返回:
-        list[dict]，每个元素是一个策略 JSON 的完整内容
-    """
+    """扫描 strategies/ 目录，返回所有策略定义列表。"""
     strategies = []
     if not _STRATEGIES_DIR.exists():
         logger.warning(f"策略目录不存在: {_STRATEGIES_DIR}")
@@ -84,11 +82,11 @@ def list_strategies() -> list[dict]:
 
     for f in sorted(_STRATEGIES_DIR.glob("*.json")):
         if f.name.startswith("_"):
-            continue  # 跳过模板文件
+            continue
         try:
             with open(f, encoding="utf-8") as fp:
                 s = json.load(fp)
-            s["_file"] = f.name  # 记录来源文件
+            s["_file"] = f.name
             strategies.append(s)
         except Exception as e:
             logger.error(f"加载策略文件失败 {f.name}: {e}")
@@ -98,15 +96,7 @@ def list_strategies() -> list[dict]:
 
 
 def get_strategy(name: str) -> dict | None:
-    """
-    按策略名获取定义。
-
-    参数:
-        name: 策略名（JSON 中的 name 字段）
-
-    返回:
-        dict 或 None
-    """
+    """按策略名获取定义。"""
     for s in list_strategies():
         if s["name"] == name:
             return s
@@ -114,82 +104,71 @@ def get_strategy(name: str) -> dict | None:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# 策略表初始化
+# 策略表初始化（从 columns + primary_key 拼 DDL）
 # ═════════════════════════════════════════════════════════════════════════════
 
+def _build_create_sql(strategy: dict) -> str:
+    """从 columns + primary_key 拼 CREATE TABLE 语句。"""
+    table = strategy["table"]
+    cols = strategy["columns"]
+    pk = strategy.get("primary_key", ["code", "date"])
+
+    col_defs = []
+    for c in cols:
+        s = f"{c['name']} {c['type']}"
+        if c.get("not_null"):
+            s += " NOT NULL"
+        col_defs.append(s)
+
+    col_str = ", ".join(col_defs)
+    pk_str = ", ".join(pk)
+    return f"CREATE TABLE IF NOT EXISTS {table} ({col_str}, PRIMARY KEY({pk_str}))"
+
+
 def ensure_strategy_table(strategy: dict) -> None:
-    """根据策略 schema 建表。若版本升级则删旧表重建。"""
-    schema = strategy.get("schema")
-    if not schema:
+    """根据 columns + primary_key 建表（IF NOT EXISTS），不删旧表。"""
+    table = strategy.get("table")
+    if not table:
         return
-    table = strategy.get("table", "")
-    version = strategy.get("version", 1)
 
     conn = dt.get_connection()
     try:
-        # 检查表是否存在
+        # 表不存在才建
         tables = conn.execute(
             "SELECT table_name FROM information_schema.tables WHERE table_name = ?",
             [table],
         ).fetchall()
 
-        if tables:
-            # 表已存在，检查版本
-            try:
-                ver_row = conn.execute(
-                    f"SELECT strategy_version FROM {table}_meta"
-                ).fetchone()
-                stored_version = ver_row[0] if ver_row else 0
-            except Exception:
-                stored_version = 0
-
-            if stored_version < version:
-                # 版本升级，删旧表重建
-                logger.warning(f"策略 {strategy['name']} 版本升级 {stored_version} → {version}，重建表")
-                conn.execute(f"DROP TABLE IF EXISTS {table}")
-                conn.execute(f"DROP TABLE IF EXISTS {table}_meta")
-            else:
-                # 版本一致，不需要重建
-                return
-
-        # 建表
-        conn.execute(schema)
-        # 建版本元信息表
-        conn.execute(
-            f"CREATE TABLE IF NOT EXISTS {table}_meta (strategy_version INTEGER)"
-        )
-        conn.execute(f"DELETE FROM {table}_meta")
-        conn.execute(f"INSERT INTO {table}_meta VALUES ({version})")
-        logger.debug(f"策略表 {table} 已就绪 (v{version})")
-    finally:
-        conn.close()
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-# 检查策略数据是否存在
-# ═════════════════════════════════════════════════════════════════════════════
-
-def _has_data(strategy: dict, date: str) -> bool:
-    """检查策略表是否有指定日期的数据。"""
-    table = strategy["table"]
-    conn = dt.get_read_connection()
-    try:
-        # 先看表存不存在
-        tables = conn.execute(
-            "SELECT table_name FROM information_schema.tables WHERE table_name = ?",
-            [table],
-        ).fetchall()
         if not tables:
-            return False
-        # 查有无该日期数据
-        result = conn.execute(
-            f"SELECT COUNT(*) FROM {table} WHERE date = ?", [date]
-        ).fetchone()
-        return result[0] > 0 if result else False
-    except Exception:
-        return False
+            ddl = _build_create_sql(strategy)
+            conn.execute(ddl)
+            logger.info(f"策略表 {table} 已创建")
     finally:
         conn.close()
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# last_date 管理（读写 JSON 文件）
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _update_last_date(strategy: dict, date: str) -> None:
+    """计算完毕后，更新 JSON 文件中的 last_date 字段。"""
+    name = strategy["name"]
+    filepath = _STRATEGIES_DIR / strategy.get("_file", f"{name}.json")
+
+    if not filepath.exists():
+        logger.warning(f"策略文件不存在: {filepath}")
+        return
+
+    try:
+        with open(filepath, encoding="utf-8") as f:
+            data = json.load(f)
+        data["last_date"] = date
+        with open(filepath, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        logger.debug(f"策略 {name} last_date 更新为 {date}")
+    except Exception as e:
+        logger.error(f"更新 last_date 失败: {e}")
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -202,27 +181,24 @@ def _compute_python(strategy: dict, date: str) -> int:
     func = _COMPUTE_FUNCS.get(name)
 
     if func is None:
-        logger.error(f"策略 {name} 没有注册计算函数（_COMPUTE_FUNCS 中无此 key）")
+        logger.error(f"策略 {name} 没有注册计算函数")
         return 0
 
     params = strategy.get("params", {})
 
-    # 函数签名: func(date, params) -> pd.DataFrame
-    result_df = func(date=date, params=params)
+    # 函数签名: func(date: str, **kwargs) -> pd.DataFrame
+    result_df = func(date=date, **params)
 
     if result_df is None or result_df.empty:
-        logger.warning(f"策略 {name} 计算返回空数据")
+        logger.warning(f"策略 {name} 计算返回空数据 (date={date})")
         return 0
 
     # 写入策略表
     table = strategy["table"]
     conn = dt.get_connection()
     try:
-        # 确保表存在（含版本检查）
         ensure_strategy_table(strategy)
-        # 先删该日期旧数据（避免重复）
         conn.execute(f"DELETE FROM {table} WHERE date = ?", [date])
-        # 写入新数据
         conn.execute(f"INSERT INTO {table} SELECT * FROM result_df")
         count = len(result_df)
         logger.info(f"策略 {name} 写入 {count} 条数据 (date={date})")
@@ -232,19 +208,19 @@ def _compute_python(strategy: dict, date: str) -> int:
 
 
 def _compute_sql(strategy: dict, date: str) -> int:
-    """执行 SQL 语句计算策略结果。"""
+    """执行 SQL 语句计算策略结果并写入。"""
     compute = strategy["compute"]
     sql_template = compute["sql"]
     table = strategy["table"]
 
-    # 替换占位符
-    sql = sql_template.replace("{table}", table).replace("{date}", date)
+    # 替换 {table} 占位符
+    sql = sql_template.replace("{table}", table)
 
     conn = dt.get_connection()
     try:
-        conn.execute(strategy["schema"])
+        ensure_strategy_table(strategy)
         conn.execute(f"DELETE FROM {table} WHERE date = ?", [date])
-        conn.execute(sql, [date])
+        conn.execute(f"INSERT INTO {table} {sql}", [date])
         count = conn.execute(
             f"SELECT COUNT(*) FROM {table} WHERE date = ?", [date]
         ).fetchone()[0]
@@ -255,16 +231,7 @@ def _compute_sql(strategy: dict, date: str) -> int:
 
 
 def compute_strategy(strategy: dict, date: str) -> int:
-    """
-    执行策略计算，返回写入条数。
-
-    参数:
-        strategy: 策略定义 dict
-        date:     目标日期，格式 'YYYY-MM-DD'
-
-    返回:
-        写入条数
-    """
+    """执行策略计算，返回写入条数。"""
     compute_type = strategy["compute"]["type"]
 
     if compute_type == "python":
@@ -286,39 +253,45 @@ def query_strategy(
     force_compute: bool = False,
 ) -> pd.DataFrame:
     """
-    查询策略结果（透明计算：若缺失则自动触发）。
+    查询策略结果。
 
-    参数:
-        name:          策略名
-        date:          目标日期，格式 'YYYY-MM-DD'
-        force_compute: 强制重新计算（忽略已有数据）
-
-    返回:
-        pd.DataFrame
+    流程：
+      1. force_compute=True → 跳过缓存，直接计算
+      2. last_date == date → 查表返回缓存
+      3. 否则 → 计算 → 写表 → 更新 last_date → 查表返回
     """
     strategy = get_strategy(name)
     if strategy is None:
         raise ValueError(f"策略不存在: {name}")
 
-    # 检查是否需要计算
-    if not force_compute and _has_data(strategy, date):
-        logger.debug(f"策略 {name} 已有 {date} 数据，直接查询")
-    else:
-        logger.info(f"策略 {name} 缺少 {date} 数据，开始计算...")
+    table = strategy.get("table")
+    if not table:
+        raise ValueError(f"策略 {name} 缺少 table 定义")
+
+    # 判断是否需要计算
+    need_compute = force_compute
+    if not need_compute:
+        last_date = strategy.get("last_date", "")
+        if last_date != date:
+            need_compute = True
+
+    if need_compute:
+        logger.info(f"策略 {name} 开始计算 (date={date})...")
         count = compute_strategy(strategy, date)
         if count == 0:
             logger.warning(f"策略 {name} 计算结果为空")
             return pd.DataFrame()
+        # 计算成功，更新 last_date
+        _update_last_date(strategy, date)
 
-    # 查询结果
-    query_sql = strategy.get("query")
-    if not query_sql:
-        # 没有自定义 query，用默认
-        query_sql = f"SELECT * FROM {strategy['table']} WHERE date = ? ORDER BY rank"
+    # 查表返回
+    read_sql = strategy.get("read_sql")
+    if not read_sql:
+        read_sql = f"SELECT * FROM {table} WHERE date = ? ORDER BY rank"
 
     conn = dt.get_read_connection()
     try:
-        result = conn.execute(query_sql, [date]).df()
+        result = conn.execute(read_sql, [date]).df()
     finally:
         conn.close()
 
@@ -331,24 +304,14 @@ def query_strategy_range(
     end_date: str,
     force_compute: bool = False,
 ) -> pd.DataFrame:
-    """
-    查询策略在日期范围内的结果。
-
-    参数:
-        name:        策略名
-        start_date:  起始日期
-        end_date:    截止日期
-        force_compute: 强制重新计算
-
-    返回:
-        pd.DataFrame
-    """
+    """查询策略在日期范围内的结果。"""
     strategy = get_strategy(name)
     if strategy is None:
         raise ValueError(f"策略不存在: {name}")
 
     if force_compute:
         compute_strategy(strategy, end_date)
+        _update_last_date(strategy, end_date)
 
     table = strategy["table"]
     conn = dt.get_read_connection()
@@ -367,7 +330,6 @@ def query_strategy_range(
 # Screener：动态条件选股
 # ═════════════════════════════════════════════════════════════════════════════
 
-# 安全操作符白名单（防 SQL 注入）
 _SAFE_OPS = {">", ">=", "<", "<=", "=", "!=", "<>", "between", "in"}
 
 
@@ -380,26 +342,11 @@ def query_screener(
     display_cols: list[str] | None = None,
     limit: int = 200,
 ) -> pd.DataFrame:
-    """
-    动态条件选股（screener 类型策略专用）。
-
-    参数:
-        strategy:     screener 类型策略定义
-        date:         目标日期
-        filters:      筛选条件列表，每项 {"field": "xxx", "op": ">", "value": 0}
-        sort_field:   排序字段
-        sort_order:   "desc" 或 "asc"
-        display_cols: 要展示的列名列表
-        limit:        返回条数上限
-
-    返回:
-        pd.DataFrame
-    """
+    """动态条件选股（screener 类型策略专用）。"""
     source = strategy["source"]
     adjustflag = strategy.get("adjustflag", "3")
     fields_def = {f["name"]: f for f in strategy.get("fields", [])}
 
-    # 默认值
     if filters is None:
         filters = strategy.get("default_filters", [])
     if sort_field is None:
@@ -418,7 +365,6 @@ def query_screener(
         op = f["op"].lower().strip()
         value = f["value"]
 
-        # 安全校验
         if field not in fields_def:
             logger.warning(f"screener: 未知字段 {field}，跳过")
             continue
@@ -426,7 +372,6 @@ def query_screener(
             logger.warning(f"screener: 不安全操作符 {op}，跳过")
             continue
 
-        # 判断字段属于哪个表（d. 还是 i.）
         prefix = _field_prefix(field, fields_def)
 
         if op == "between":
@@ -490,12 +435,7 @@ def _field_prefix(field: str, fields_def: dict) -> str:
 # ═════════════════════════════════════════════════════════════════════════════
 
 def strategy_info(name: str) -> dict | None:
-    """
-    获取策略的元信息（不触发计算）。
-
-    返回:
-        dict，包含 name, description, type, table, data_status 等
-    """
+    """获取策略的元信息（不触发计算）。"""
     strategy = get_strategy(name)
     if strategy is None:
         return None
@@ -521,7 +461,7 @@ def strategy_info(name: str) -> dict | None:
             [table],
         ).fetchall()
         if not tables:
-            return {**strategy, "data_status": "表不存在", "rows": 0, "date_range": None}
+            return {**result, "data_status": "表不存在", "rows": 0, "date_range": None}
 
         count = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
         r = conn.execute(
@@ -529,12 +469,12 @@ def strategy_info(name: str) -> dict | None:
         ).fetchone()
         date_range = f"{r[0]} ~ {r[1]}" if r[0] else None
     except Exception as e:
-        return {**strategy, "data_status": f"查询失败: {e}", "rows": 0, "date_range": None}
+        return {**result, "data_status": f"查询失败: {e}", "rows": 0, "date_range": None}
     finally:
         conn.close()
 
     return {
-        **strategy,
+        **result,
         "data_status": "ok" if count > 0 else "无数据",
         "rows": count,
         "date_range": date_range,
@@ -544,50 +484,32 @@ def strategy_info(name: str) -> dict | None:
 # ═════════════════════════════════════════════════════════════════════════════
 # 策略计算函数
 # ═════════════════════════════════════════════════════════════════════════════
-# 签名统一：func(date: str, params: dict) -> pd.DataFrame
-# 返回的 DataFrame 列结构必须与对应策略 JSON 的 schema 一致
+# 签名：func(date: str, **kwargs) -> pd.DataFrame
+# date 是 K线数据的入口，其余参数为策略调节旋钮
+# 返回的 DataFrame 列结构必须与对应策略 JSON 的 columns 一致
 # ═════════════════════════════════════════════════════════════════════════════
 
 
-# ── 多因子评分 ──────────────────────────────────────────────────────────────
+# ── 流通市值排行 ────────────────────────────────────────────────────────────
 
-@register_compute("multi_factor_score")
-def multi_factor_score(
-    date: str,
-    params: dict,
-) -> pd.DataFrame:
+@register_compute("market_cap_rank")
+def market_cap_rank(date: str) -> pd.DataFrame:
     """
-    多因子综合评分策略。
+    流通市值排行策略。
 
-    逻辑：
-      1. 从 daily_bar 取指定 date 的全市场数据
-      2. 对每个因子按百分位排名（0~100）
-      3. 加权求和得到综合评分
-      4. 按评分排名
-
-    参数 (params):
-        factors:   参与评分的因子列表，如 ["pe_ttm", "pb_mrq", "turn"]
-        weights:   对应权重，如 [0.4, 0.3, 0.3]
-        ascending: 对应排序方向，True=越小越好（如PE），False=越大越好（如换手率）
-
-    返回:
-        DataFrame，列: code, code_name, date, score, rank
+    公式：流通市值(亿) = close × volume × 100 / turn / 1e8
+      - close: 收盘价（元）
+      - volume: 成交量（股）
+      - turn: 换手率（百分比数值，如 2.5 表示 2.5%）
+      - ×100: 每手100股，还原总流通股数 = volume / turn% × 100
     """
-    factors = params.get("factors", ["pe_ttm", "pb_mrq", "turn"])
-    weights = params.get("weights", [1.0 / len(factors)] * len(factors))
-    ascending = params.get("ascending", [True] * len(factors))
-
-    # 查询当天全市场数据
     conn = dt.get_read_connection()
     try:
-        cols = ", ".join(["code", "code_name"] + factors)
         df = conn.execute(
-            f"""
-            SELECT {cols}
+            """
+            SELECT code, code_name, close, volume, turn
             FROM daily_bar
-            WHERE date = ?
-              AND adjustflag = '3'
-              AND tradestatus = '1'
+            WHERE date = ? AND adjustflag = '3' AND tradestatus = '1'
             """,
             [date],
         ).df()
@@ -595,58 +517,36 @@ def multi_factor_score(
         conn.close()
 
     if df.empty:
-        logger.warning(f"multi_factor_score: {date} 无日线数据")
-        return pd.DataFrame(columns=["code", "code_name", "date", "score", "rank"])
+        return pd.DataFrame(columns=["code", "code_name", "date", "flow_cap", "rank"])
 
-    # 过滤掉因子值为 NaN 的行
-    df = df.dropna(subset=factors)
+    df = df[df["turn"] > 0].copy()
 
-    # 计算百分位排名
-    score = pd.Series(0.0, index=df.index)
-    for factor, weight, asc in zip(factors, weights, ascending):
-        rank_col = df[factor].rank(pct=True, ascending=asc) * 100
-        score += rank_col * weight
+    df["flow_cap"] = (df["close"] * df["volume"] * 100 / df["turn"] / 1e8).round(4)
 
+    df = df.sort_values("flow_cap", ascending=False)
     df["date"] = date
-    df["score"] = score.round(2)
-    df = df.sort_values("score", ascending=False)
     df["rank"] = range(1, len(df) + 1)
 
-    return df[["code", "code_name", "date", "score", "rank"]]
+    return df[["code", "code_name", "date", "flow_cap", "rank"]]
 
 
-# ── 动量突破 ────────────────────────────────────────────────────────────────
-
-@register_compute("momentum_breakout")
-def momentum_breakout(
-    date: str,
-    params: dict,
-) -> pd.DataFrame:
+@register_compute("market_cap_growth")
+def market_cap_growth(date: str) -> pd.DataFrame:
     """
-    动量突破策略。
+    市值增长策略。
 
     逻辑：
-      1. 取指定 date 的收盘价和 N 日前收盘价，计算涨幅
-      2. 取当日量比（成交量 / 5日均量）
-      3. 筛选：涨幅 > 0 且 量比 > 阈值 的股票
-      4. 按涨幅排名
-
-    参数 (params):
-        lookback_days:        回看天数，默认 20
-        vol_ratio_threshold:  量比阈值，默认 1.5
-
-    返回:
-        DataFrame，列: code, code_name, date, n_day_chg, vol_ratio, close, rank
+      1. 取指定 date 和前一个交易日的 daily_bar
+      2. 分别计算两天的流通市值 = close × volume × 100 / turn / 1e8
+      3. cap_change = 今日市值 - 昨日市值
+      4. 按 cap_change 降序排名
     """
-    lookback = params.get("lookback_days", 20)
-    vol_threshold = params.get("vol_ratio_threshold", 1.5)
-
     conn = dt.get_read_connection()
     try:
         # 取当天数据
         df_today = conn.execute(
             """
-            SELECT code, code_name, close, volume, amount
+            SELECT code, code_name, close, volume, turn
             FROM daily_bar
             WHERE date = ? AND adjustflag = '3' AND tradestatus = '1'
             """,
@@ -654,195 +554,55 @@ def momentum_breakout(
         ).df()
 
         if df_today.empty:
-            return pd.DataFrame(
-                columns=["code", "code_name", "date", "n_day_chg", "vol_ratio", "close", "rank"]
-            )
+            return pd.DataFrame(columns=["code", "code_name", "date", "flow_cap", "cap_change", "rank"])
 
-        # 取 N 天前的收盘价
-        past_date_row = conn.execute(
+        # 取前一个交易日
+        prev_date_row = conn.execute(
             """
             SELECT DISTINCT date FROM daily_bar
             WHERE date < ? AND adjustflag = '3'
-            ORDER BY date DESC
-            LIMIT 1 OFFSET ?
+            ORDER BY date DESC LIMIT 1
             """,
-            [date, lookback - 1],
+            [date],
         ).fetchone()
 
-        if not past_date_row:
-            logger.warning(f"momentum_breakout: 找不到 {lookback} 天前的数据")
-            return pd.DataFrame(
-                columns=["code", "code_name", "date", "n_day_chg", "vol_ratio", "close", "rank"]
-            )
+        if not prev_date_row:
+            logger.warning(f"market_cap_growth: {date} 前无交易日数据")
+            return pd.DataFrame(columns=["code", "code_name", "date", "flow_cap", "cap_change", "rank"])
 
-        past_date = str(past_date_row[0])
+        prev_date = str(prev_date_row[0])
 
-        df_past = conn.execute(
+        # 取前一日数据（不限 tradestatus，停牌也算市值）
+        df_prev = conn.execute(
             """
-            SELECT code, close AS past_close
+            SELECT code, close, volume, turn
             FROM daily_bar
-            WHERE date = ? AND adjustflag = '3'
+            WHERE date = ? AND adjustflag = '3' AND turn > 0
             """,
-            [past_date],
+            [prev_date],
         ).df()
-
-        # 取 5 日均量
-        df_vol = conn.execute(
-            """
-            SELECT code, AVG(volume) AS vol_ma5
-            FROM daily_bar
-            WHERE date <= ? AND adjustflag = '3' AND tradestatus = '1'
-              AND date >= (
-                  SELECT DISTINCT date FROM daily_bar
-                  WHERE date <= ? AND adjustflag = '3'
-                  ORDER BY date DESC LIMIT 1 OFFSET 4
-              )
-            GROUP BY code
-            """,
-            [date, date],
-        ).df()
-
     finally:
         conn.close()
 
-    # 合并
-    df = df_today.merge(df_past, on="code", how="inner")
-    df = df.merge(df_vol, on="code", how="left")
+    # 过滤换手率异常
+    df_today = df_today[df_today["turn"] > 0].copy()
 
-    # 计算 N 日涨幅
-    df["n_day_chg"] = ((df["close"] / df["past_close"]) - 1) * 100
-    df["n_day_chg"] = df["n_day_chg"].round(2)
+    # 计算今日市值
+    df_today["flow_cap"] = (df_today["close"] * df_today["volume"] * 100 / df_today["turn"] / 1e8).round(4)
 
-    # 计算量比
-    df["vol_ratio"] = (df["volume"] / df["vol_ma5"]).round(2)
+    # 计算昨日市值
+    df_prev["prev_flow_cap"] = (df_prev["close"] * df_prev["volume"] * 100 / df_prev["turn"] / 1e8).round(4)
 
-    # 筛选：涨幅 > 0 且 量比 > 阈值
-    df = df[(df["n_day_chg"] > 0) & (df["vol_ratio"] >= vol_threshold)]
+    # 合并，计算变化
+    df = df_today.merge(df_prev[["code", "prev_flow_cap"]], on="code", how="inner")
+    df["cap_change"] = (df["flow_cap"] - df["prev_flow_cap"]).round(4)
 
     # 排名
-    df = df.sort_values("n_day_chg", ascending=False)
+    df = df.sort_values("cap_change", ascending=False)
     df["date"] = date
     df["rank"] = range(1, len(df) + 1)
 
-    return df[["code", "code_name", "date", "n_day_chg", "vol_ratio", "close", "rank"]]
-
-
-# ── 资金进出推算 ────────────────────────────────────────────────────────────
-
-@register_compute("capital_flow")
-def capital_flow(
-    date: str,
-    params: dict,
-) -> pd.DataFrame:
-    """
-    资金进出推算策略。
-
-    核心逻辑：
-      流通市值 + 实际资金净流入/出 + N日累计净流入占期初流值比。
-
-    公式推导：
-      流通市值(亿) = close × volume × 100 / turn / 1e8
-        （收盘价口径，与股票软件一致）
-
-      每日实际资金净流入(亿) = amount × (close - prev_close) / prev_close / 1e8
-        涨跌幅加权：涨了钱进来，跌了钱出去，平盘≈0
-
-      N日累计净流入占期初流值(%) = Σ(cap_daily) / flow_cap[t-N] × 100
-        cap_ratio > 0 → N日内资金净流入
-        cap_ratio < 0 → N日内资金净流出
-
-    参数 (params):
-        lookback_days: N日周期，默认 5
-
-    返回:
-        DataFrame，列: code, code_name, date, flow_cap, cap_daily, cap_ratio, close, turn
-    """
-    N = params.get("lookback_days", 5)
-
-    conn = dt.get_read_connection()
-    try:
-        # 找目标日期及之前最近 N+1 个交易日
-        date_rows = conn.execute(
-            """
-            SELECT DISTINCT date FROM daily_bar
-            WHERE date <= ? AND adjustflag = '3'
-            ORDER BY date DESC
-            LIMIT ?
-            """,
-            [date, N + 1],
-        ).fetchall()
-
-        if not date_rows:
-            logger.warning(f"capital_flow: {date} 附近无交易日数据")
-            return pd.DataFrame(
-                columns=["code", "code_name", "date", "flow_cap",
-                         "cap_daily", "cap_ratio", "close", "turn"]
-            )
-
-        trading_dates = [str(r[0]) for r in reversed(date_rows)]  # 升序
-        earliest = trading_dates[0]
-        latest = trading_dates[-1]
-
-        # 拉这 N+1 天的全市场数据
-        df = conn.execute(
-            """
-            SELECT code, code_name, date, close, turn, amount, volume,
-                   tradestatus
-            FROM daily_bar
-            WHERE date BETWEEN ? AND ?
-              AND adjustflag = '3'
-            ORDER BY code, date
-            """,
-            [earliest, latest],
-        ).df()
-    finally:
-        conn.close()
-
-    if df.empty:
-        return pd.DataFrame(
-            columns=["code", "code_name", "date", "flow_cap",
-                     "cap_daily", "cap_ratio", "close", "turn"]
-        )
-
-    # 日期转字符串方便比较
-    df["date"] = pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d")
-
-    # 过滤停牌
-    df = df[df["tradestatus"] == "1"].copy()
-
-    # 过滤换手率异常
-    df = df[df["turn"] > 0].copy()
-
-    # 计算流通市值(亿): close(元) * volume(股) * 100 / turn(%) / 1e8 = 亿元
-    df["flow_cap"] = (df["close"] * df["volume"] * 100 / df["turn"] / 1e8).round(4)
-
-    # 按股票分组排序
-    df = df.sort_values(["code", "date"])
-
-    # 每日实际资金净流入(亿) = amount × 涨跌幅 / 1e8
-    prev_close = df.groupby("code")["close"].shift(1)
-    chg_pct = (df["close"] - prev_close) / prev_close
-    df["cap_daily"] = (df["amount"] * chg_pct / 1e8).round(4)
-
-    # N日累计净流入占期初流值(%) = rolling(N).sum(cap_daily) / flow_cap[t-N] * 100
-    cum_flow = df.groupby("code")["cap_daily"].rolling(N, min_periods=N).sum()
-    cum_flow = cum_flow.reset_index(level=0, drop=True)  # 对齐index
-    flow_cap_N_ago = df.groupby("code")["flow_cap"].shift(N)
-    df["cap_ratio"] = (cum_flow / flow_cap_N_ago * 100).round(4)
-
-    # 只保留目标日期的行
-    result = df[df["date"] == latest].copy()
-
-    # NaN 表示没有足够历史，写入时自然变成 NULL
-    result = result[["code", "code_name", "date", "flow_cap",
-                     "cap_daily", "cap_ratio", "close", "turn"]]
-
-    # 按 cap_ratio 降序（NaN 排末尾）
-    result = result.sort_values("cap_ratio", ascending=False, na_position="last")
-
-    logger.info(f"capital_flow: {latest} 共 {len(result)} 只股票，"
-                f"其中 {result['cap_ratio'].notna().sum()} 只有 {N}日变化率")
-    return result
+    return df[["code", "code_name", "date", "flow_cap", "cap_change", "rank"]]
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -867,16 +627,17 @@ if __name__ == "__main__":
         print(f"  {name} → {fn.__name__}")
 
     print("\n===== 策略元信息 =====")
-    info = strategy_info("multi_factor_score")
+    info = strategy_info("market_cap_rank")
     if info:
         print(f"  name: {info['name']}")
         print(f"  table: {info['table']}")
+        print(f"  last_date: {info.get('last_date', '')}")
         print(f"  data_status: {info['data_status']}")
         print(f"  rows: {info['rows']}")
         print(f"  date_range: {info['date_range']}")
 
     print("\n===== 执行策略计算 =====")
-    df = query_strategy("multi_factor_score", "2026-04-28")
+    df = query_strategy("market_cap_rank", "2026-04-28")
     if not df.empty:
         print(df.head(10).to_string())
     else:

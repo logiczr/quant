@@ -1,0 +1,41 @@
+{
+  "name": "market_cap_rank",
+  "description": "流通市值排行（close × volume × 100 / turn）",
+  "table": "strategy_market_cap_rank",
+  "columns": [
+    {
+      "name": "code",
+      "type": "VARCHAR",
+      "not_null": true
+    },
+    {
+      "name": "code_name",
+      "type": "VARCHAR"
+    },
+    {
+      "name": "date",
+      "type": "DATE",
+      "not_null": true
+    },
+    {
+      "name": "flow_cap",
+      "type": "DOUBLE"
+    },
+    {
+      "name": "rank",
+      "type": "INTEGER"
+    }
+  ],
+  "primary_key": [
+    "code",
+    "date"
+  ],
+  "compute": {
+    "type": "python",
+    "function": "market_cap_rank"
+  },
+  "write_sql": "DELETE FROM strategy_market_cap_rank WHERE date = ?; INSERT INTO strategy_market_cap_rank SELECT * FROM df",
+  "read_sql": "SELECT * FROM strategy_market_cap_rank WHERE date = ? ORDER BY rank",
+  "params": {},
+  "last_date": "2026-04-29"
+}

@@ -49,3 +49,11 @@ def run_now(task_id: str) -> dict:
     except Exception as e:
         logger.warning(f"[Client] 触发任务失败: {task_id} - {e}")
         return {"success": False, "error": str(e)}
+
+def get_last_fetch() -> dict:
+    """获取最近一次收盘拉取的结果。"""
+    try:
+        return requests.get(f"{DAEMON_URL}/last_fetch", timeout=TIMEOUT).json()
+    except Exception as e:
+        logger.warning(f"[Client] 获取 last_fetch 失败: {e}")
+        return {}
