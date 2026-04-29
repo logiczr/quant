@@ -15,7 +15,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 import duckdb_tools as dt
 import index_tools as it
 import daemon_client as dc
-
+import strategy as se
 
 # ─── 页面配置 ───
 st.set_page_config(
@@ -119,7 +119,6 @@ if page == "📊 排行榜":
             height=600,
         )
  
-
 # ─── 2. 个股查询 ───
 elif page == "🔍 个股查询":
     st.title("个股查询")
@@ -254,4 +253,89 @@ elif page == "🔧 数据库维护":
                 else:
                     st.toast(f"❌ {task_id} 触发失败：{result.get('detail', result.get('error', '未知'))}")
 
+elif page == "📈 因子分析":
+    st.title("策略看板")
+
+    # 加载策略列表
+    strategies = se.list_strategies()
+    if not strategies:
+        st.warning("strategies/ 目录下没有策略定义文件")
+        st.stop()
+
+    # 策略选择
+    strategy_names = [s["name"] for s in strategies]
+    strategy_labels = [f"{s['name']} — {s.get('description', '')}" for s in strategies]
+    selected_idx = st.selectbox(
+        "选择策略",
+        range(len(strategy_labels)),
+        format_func=lambda i: strategy_labels[i],
+    )
+    selected = strategies[selected_idx]
+
+    # 日期选择
+    query_date = st.date_input("查询日期", pd.Timestamp.today())
+    date_str = query_date.strftime("%Y-%m-%d")
+
+    # 策略信息
+    info = se.strategy_info(selected["name"])
+    if info:
+        if info.get("type") == "screener":
+            st.caption(
+                f"类型: 动态选股 | "
+                f"状态: {info['data_status']}"
+            )
+        else:
+            st.caption(
+                f"策略表: `{info['table']}` | "
+                f"状态: {info['data_status']} | "
+                f"数据量: {info['rows']} 行 | "
+                f"日期范围: {info.get('date_range', '无')}"
+            )
+
+    # ── screener 类型：动态条件 UI ──
+    if selected.get("type") == "screener":
+        fields_def = {f["name"]: f for f in selected.get("fields", [])}
+        filterable_fields = [f for f in selected.get("fields", []) if f.get("filterable", False)]
+
+        # 筛选条件
+        st.subheader("筛选条件")
+        default_filters = selected.get("default_filters", [])
+
+        # 用 session_state 存条件列表
+        if "screener_filters" not in st.session_state:
+            st.session_state.screener_filters = list(default_filters)
+
+        # 显示当前条件
+        filters_to_remove = []
+        for i, f in enumerate(st.session_state.screener_filters):
+            col1, col2, col3, col4 = st.columns([3, 1, 3, 1])
+            with col1:
+                field_options = {ff["name"]: ff["label"] for ff in filterable_fields}
+                current_field = st.selectbox(
+                    "字段",
+                    list(field_options.keys()),
+                    index=list(field_options.keys()).index(f["field"]) if f["field"] in field_options else 0,
+                    key=f"filter_field_{i}",
+                    format_func=lambda x: field_options.get(x, x),
+                )
+                st.session_state.screener_filters[i]["field"] = current_field
+            with col2:
+                op = st.selectbox(
+                    "条件",
+                    [">", ">=", "<", "<=", "=", "!="],
+                    index=[">", ">=", "<", "<=", "=", "!="].index(f.get("op", ">")),
+                    key=f"filter_op_{i}",
+                )
+                st.session_state.screener_filters[i]["op"] = op
+            with col3:
+                value = st.number_input(
+                    "值",
+                    value=float(f.get("value", 0)),
+                    key=f"filter_value_{i}",
+                    format="%f",
+                )
+                st.session_state.screener_filters[i]["value"] = value
+            with col4:
+                if st.button("🗑", key=f"filter_del_{i}"):
+                    filters_to_remove.append(i)
 
