@@ -58,14 +58,14 @@ def task_post_market_fetch() -> dict:
     logger.info("[Scheduler] 收盘批次拉取开始 ...")
 
     today = datetime.today().strftime("%Y-%m-%d")
-    stocks = dt.get_stock_info()[["code"]]
+    stocks = dt.get_stock_info()[["code", "code_name"]]
     total = len(stocks)
     failed_codes = []
     success_count = 0
 
     logger.info(f"[Scheduler] 共 {total} 只股票待拉取")
 
-    df = datat.fetch_daily(stocks,start_date='2026-04-20',end_date=today,adjustflag='3')
+    df = datat.fetch_daily(stocks,start_date=today,end_date=today,adjustflag='3')
     #注意此处的date起始日期需要在本层实现
     dt.insert_daily(df)
     success_count = len(df)

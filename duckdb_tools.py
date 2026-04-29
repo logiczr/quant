@@ -202,7 +202,7 @@ def _normalize_minute_df(df: pd.DataFrame, frequency: str) -> pd.DataFrame:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def upsert_stock_info(
-    df: pd.DataFrame,
+    df: pd.DataFrame | None = None,
     db_path: str = _DEFAULT_DB_PATH,
 ) -> int:
     """
@@ -243,7 +243,6 @@ def upsert_stock_info(
     df["updated_at"] = pd.to_datetime(datetime.now(), errors="coerce")
 
     conn = get_connection(db_path)
-    print(df)
 
     # 使用 DuckDB INSERT OR REPLACE（UPSERT by PRIMARY KEY）
     conn.execute("DELETE FROM stock_info")
@@ -352,35 +351,6 @@ def insert_daily(
     logger.info(f"insert_daily: 共写入 {total} 条日线数据")
     conn.close()
     return total
-
-
-def check_all_daily_gaps(
-        start_date:str,
-        db_path: str = _DEFAULT_DB_PATH,
-):
-    stk_info = get_stock_info()
-    code_list = stk_info[['code','ipo_date']]
-    sd = pd.to_datetime(start_date, errors="coerce") #type: ignore
-    #today = datetime.now().strftime("%Y-%m-%d")
-    today = '2026-05-05'
-    conn = get_connection(db_path)
-    start = []
-    import time
-    timer1 = time.time()
-    for _, code in code_list.iterrows():
-        newest = conn.execute(
-                "SELECT MAX(date) FROM daily_bar WHERE code = ? AND adjustflag = ?",
-                [code['code'], '3'],
-            ).fetchone()[0].strftime("%Y-%m-%d") #type: ignore
-        if code['ipo_date'] < sd:
-            start.append([code['code'],code['ipo_date'].strftime("%Y-%m-%d"),today])
-        else:
-            if newest < today:
-                start.append([newest,today])
-    timer2 = time.time()
-    print(timer2 - timer1)
-    print(start)
-    return 0
 
 def get_daily(
     code: str,

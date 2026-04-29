@@ -241,7 +241,7 @@ elif page == "🔧 数据库维护":
     st.subheader("手动触发")
     task_options = {
         "refresh_stock_info": "🔄 刷新股票列表 (08:30)",
-        "market_fetch": "📊 收盘批次拉取 (18:00)",
+        "post_market_fetch": "📊 收盘批次拉取 (18:00)",
     }
 
     cols = st.columns(len(task_options))
