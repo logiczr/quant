@@ -618,10 +618,6 @@ if __name__ == "__main__":
         stream=sys.stdout,
     )
 
-    print("\n===== 策略列表 =====")
-    for s in list_strategies():
-        print(f"  {s['name']}: {s['description']}")
-
     print("\n===== 已注册计算函数 =====")
     for name, fn in _COMPUTE_FUNCS.items():
         print(f"  {name} → {fn.__name__}")
@@ -636,9 +632,3 @@ if __name__ == "__main__":
         print(f"  rows: {info['rows']}")
         print(f"  date_range: {info['date_range']}")
 
-    print("\n===== 执行策略计算 =====")
-    df = query_strategy("market_cap_rank", "2026-04-28")
-    if not df.empty:
-        print(df.head(10).to_string())
-    else:
-        print("计算结果为空（可能当天非交易日或数据不足）")

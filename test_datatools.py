@@ -1,5 +1,6 @@
 import data_tools
 import baostock as bs # type: ignore
+import pandas as pd
 import logging
 import sys
 
@@ -10,9 +11,13 @@ if __name__ == "__main__":
         datefmt="%Y-%m-%d %H:%M:%S",
         stream=sys.stdout,
     )
-    ls = data_tools.fetch_stock_list()
-    ls = ls[:10]
-    res = data_tools.fetch_daily(stock_list=ls, start_date="2026-02-01", end_date="2026-04-17",adjustflag="3")
-    print(res)
-    res2 = data_tools.fetch_minute(stock_list=ls, start_date="2026-02-15", end_date="2026-04-17",frequency="5",adjustflag="3")
-    print(res2)
+    lg = bs.login()
+    rs = bs.query_stock_industry()
+    industry_list = []
+    while (rs.error_code == '0') & rs.next():
+    # 获取一条记录，将记录合并在一起
+        industry_list.append(rs.get_row_data())
+    result = pd.DataFrame(industry_list, columns=rs.fields)
+    result.to_csv("./res.csv", encoding="gbk", index=False)
+    print(result)
+    bs.logout()
