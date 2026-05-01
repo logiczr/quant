@@ -41,7 +41,7 @@
   "write_sql": "DELETE FROM strategy_market_cap_growth WHERE date = ?; INSERT INTO strategy_market_cap_growth SELECT * FROM df",
   "read_sql": "SELECT * FROM strategy_market_cap_growth WHERE date = ? ORDER BY rank",
   "params": {},
-  "last_date": "2026-04-28",
+  "last_date": "2026-04-29",
   "_说明": {
     "flow_cap": "今日流通市值（亿元）",
     "cap_change": "今日市值 - 昨日市值（亿元），正值=增长，负值=缩水",

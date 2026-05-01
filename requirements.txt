@@ -26,6 +26,7 @@ numpy
 packaging
 pandas
 pillow
+plotly
 protobuf
 pyarrow
 pydantic

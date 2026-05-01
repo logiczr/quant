@@ -5,6 +5,9 @@
 
 import streamlit as st
 import pandas as pd
+import numpy as np
+import plotly.express as px
+import plotly.graph_objects as go
 import sys
 from pathlib import Path
 import logging
@@ -46,79 +49,150 @@ except Exception as e:
 # ─── 主导航 ───
 page = st.sidebar.radio(
     "功能",
-    ["📊 排行榜", "🔍 个股查询", "📋 股票列表","📈 因子分析","🔧 数据库维护"],
+    ["📊 大盘概览", "🔍 个股查询", "📋 股票列表","📈 因子分析","🔧 数据库维护"],
 )
 
-# ─── 1. 排行榜 ───
-if page == "📊 排行榜":
-    st.title("排行榜")
-    
-    rank_type = st.selectbox(
-        "排行类型",
-        ["量比", "日涨幅", "3日涨幅", "5日涨幅", "换手率"],
+# ─── 1. 大盘概览 ───
+if page == "📊 大盘概览":
+    st.title("大盘概览")
+
+    # ── 指数卡片 ──
+    INDEX_CODES = {
+        "上证指数": "sh.000001",
+        "深证成指": "sz.399001",
+        "创业板指": "sz.399006",
+    }
+
+    # TODO: 后端接好后替换为 DuckDB 直读
+    MOCK_INDEX_DATA = {
+        "上证指数": {"close": 3245.68, "preclose": 3217.12, "amount": 4231e8},
+        "深证成指": {"close": 10876.32, "preclose": 10918.47, "amount": 5128e8},
+        "创业板指": {"close": 2134.56, "preclose": 2119.33, "amount": 2345e8},
+    }
+    MOCK_LATEST_DATE = "2026-04-30"
+
+    # 三栏指数卡片
+    cols = st.columns(3)
+    for idx, (name, code) in enumerate(INDEX_CODES.items()):
+        with cols[idx]:
+            d = MOCK_INDEX_DATA[name]
+            close_val = d["close"]
+            preclose = d["preclose"]
+            delta_val = close_val - preclose
+            pct = delta_val / preclose * 100
+            amount_str = f"{d['amount'] / 1e8:.0f}亿"
+            st.metric(
+                label=f"{name}  `{code}`",
+                value=f"{close_val:,.2f}",
+                delta=f"{delta_val:+,.2f}  ({pct:+.2f}%)",
+            )
+            st.caption(f"成交额: {amount_str}")
+
+    st.divider()
+
+    # ── 涨跌分布 ──
+    # TODO: 后端接好后替换为 DuckDB 直读
+    st.subheader(f"涨跌分布  ({MOCK_LATEST_DATE})")
+
+    # 模拟全市场涨跌幅分布
+    np.random.seed(42)
+    _n = 5200
+    _pct = np.concatenate([
+        np.random.uniform(0, 5, 1845),       # 涨0~5%
+        np.random.uniform(-5, 0, 1567),      # 跌0~5%
+        np.zeros(312),                         # 平盘
+        np.random.uniform(5, 9.9, 89),        # 涨>5%
+        np.random.uniform(-9.9, -5, 98),      # 跌>5%
+        np.random.uniform(9.9, 10.1, 12),     # 涨停
+        np.random.uniform(-10.1, -9.9, 3),    # 跌停
+    ])
+    pct = pd.Series(_pct)
+    total = len(pct)
+
+    # ── 分区统计 ──
+    BINS = [
+        ("涨停",   lambda x: x >= 9.9,           "#8B0000"),
+        ("涨>5%",  lambda x: (x >= 5) & (x < 9.9), "#FF4444"),
+        ("涨0~5%", lambda x: (x > 0) & (x < 5),    "#FFAAAA"),
+        ("平盘",   lambda x: x == 0,                "#999999"),
+        ("跌0~5%", lambda x: (x < 0) & (x > -5),   "#A8D8A8"),
+        ("跌>5%",  lambda x: (x <= -5) & (x > -9.9), "#44CC44"),
+        ("跌停",   lambda x: x <= -9.9,             "#006400"),
+    ]
+
+    bin_data = []
+    for label, cond, color in BINS:
+        count = int(pct.loc[cond(pct)].count())
+        bin_data.append({
+            "区间": label,
+            "数量": count,
+            "占比": f"{count / total * 100:.1f}%" if total > 0 else "0%",
+            "颜色": color,
+        })
+    bin_df = pd.DataFrame(bin_data)
+
+    # ── 环状图 + 直方图 并排 ──
+    chart_col1, chart_col2 = st.columns(2)
+
+    with chart_col1:
+        # 环状图
+        fig_donut = px.pie(
+            bin_df,
+            values="数量",
+            names="区间",
+            color="区间",
+            color_discrete_map={row["区间"]: row["颜色"] for _, row in bin_df.iterrows()},
+            hole=0.55,
+        )
+        fig_donut.update_traces(
+            textinfo="label+value",
+            textfont_size=18,
+            hovertemplate="%{label}: %{value}只 (%{percent})<extra></extra>",
+        )
+        fig_donut.update_layout(
+            showlegend=True,
+            height=420,
+            margin=dict(t=10, b=10, l=10, r=10),
+            annotations=[dict(
+                text=f"{total}<br>只",
+                x=0.5, y=0.5,
+                font_size=20,
+                showarrow=False,
+            )],
+        )
+        st.plotly_chart(fig_donut, use_container_width=True)
+
+    with chart_col2:
+        # 直方图：1% 一档
+        hist_bins = list(range(-11, 12))
+        hist_counts, hist_edges = np.histogram(pct, bins=hist_bins)
+        hist_labels = [f"{hist_edges[i]:+.0f}%~{hist_edges[i+1]:+.0f}%" for i in range(len(hist_counts))]
+        hist_colors = [
+            "#FFAAAA" if hist_edges[i] >= 0 else "#A8D8A8"
+            for i in range(len(hist_counts))
+        ]
+
+        fig_hist = go.Figure(data=[go.Bar(
+            x=hist_labels,
+            y=hist_counts,
+            marker_color=hist_colors,
+            hovertemplate="%{x}: %{y}只<extra></extra>",
+        )])
+        fig_hist.update_layout(
+            xaxis_title="涨跌幅",
+            yaxis_title="家数",
+            margin=dict(t=50, b=50, l=30, r=10),
+            xaxis_tickangle=-45,
+        )
+        st.plotly_chart(fig_hist, use_container_width=True)
+
+    # ── 分区统计表 ──
+    st.dataframe(
+        bin_df[["区间", "数量", "占比"]],
+        use_container_width=True,
+        hide_index=True,
     )
 
-    top_n = st.slider("显示数量", 10, 100, 20)
-
-    # 拉全市场股票列表
-    @st.cache_data
-    def load_all_stocks():
-        df = dt.get_stock_info()[["code", "code_name"]]
-        return df
-
-    stocks = load_all_stocks()
-
-    # 批量计算近期数据（最近 N 天）
-    #today = pd.Timestamp.today().strftime("%Y-%m-%d")
-    #start = (pd.Timestamp.today() - pd.Timedelta(days=60)).strftime("%Y-%m-%d")
-    today = '2026-04-20'
-    start = '2026-04-01'
-    if st.button("计算", type="primary"):
-        with st.spinner("正在计算指标，请稍候..."):
-            result = it.calc_batch(
-                codes=stocks["code"].tolist(),
-                start_date=start,
-                end_date=today,
-                indicators=["vol_ma", "macd"],
-                adjustflag="3",
-            )
-
-        rows = []
-        for code, df in result.items():
-            if df.empty:
-                continue
-            row = df.iloc[-1]  # 取最新一天
-            rows.append({
-                "代码": code,
-                "名称": stocks[stocks["code"] == code]["code_name"].values[0],
-                "收盘价": row.get("close"),
-                "日涨幅%": row.get("pct_chg"),
-                "量比": row.get("VOL_RATIO"),
-                "换手率%": row.get("turn"),
-                "MACD_DIF": row.get("DIF"),
-                "MACD_DEA": row.get("DEA"),
-            })
-
-        rank_df = pd.DataFrame(rows)
-
-    # 过滤掉涨跌幅为空的（停牌股）
-        rank_df = rank_df.dropna(subset=["日涨幅%"])
-
-    # 按排行类型排序
-        if rank_type == "量比":
-            rank_df = rank_df.sort_values("量比", ascending=False).head(top_n)
-            rank_df = rank_df.rename(columns={"量比": "量比（当日/5日均量）"})
-    
-        rank_df = rank_df.reset_index(drop=True)
-        rank_df.index = rank_df.index + 1
-        rank_df.index.name = "排名"
-
-        st.dataframe(
-            rank_df,
-            width='stretch',
-            height=600,
-        )
- 
 # ─── 2. 个股查询 ───
 elif page == "🔍 个股查询":
     st.title("个股查询")
@@ -146,7 +220,7 @@ elif page == "🔍 个股查询":
                     start_date=start_str,
                     end_date=end_str,
                     adjustflag="3",
-                    auto_fetch=True,
+                    auto_fetch=False,
                 )
 
                 if df.empty:
@@ -190,15 +264,15 @@ elif page == "📋 股票列表":
         return dt.get_stock_info()
 
     if st.button("更新", type="primary"):
-        with st.spinner("加载数据中..."):
-            try:
-                st.info(f"开始更新")
-                dt.delete_stock_info('ALL')
-                dt.upsert_stock_info(None) #type: ignore
+        if dc.is_alive():
+            result = dc.run_now("refresh_stock_info")
+            if result.get("success"):
+                st.toast("✅ 股票列表刷新已触发，稍后刷新页面")
                 load_stocks.clear()
-                st.success(f"更新成功")
-            except Exception as e:
-                st.error(f"更新失败: {e}")
+            else:
+                st.toast(f"❌ 触发失败：{result.get('detail', result.get('error', '未知'))}")
+        else:
+            st.warning("守护进程离线，无法触发刷新")
 
 
     df = load_stocks()

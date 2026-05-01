@@ -32,7 +32,9 @@ from data_tools import (
     fetch_daily_single,
     fetch_minute,
     fetch_stock_list,
+    fetch_index_list,
     DAILY_COLUMNS,
+    INDEX_DAILY_COLUMNS,
     MINUTE_COLUMNS,
 )
 
@@ -133,10 +135,28 @@ CREATE TABLE IF NOT EXISTS minute_bar (
 );
 """
 
+_DDL_INDEX_DAILY_BAR = """
+CREATE TABLE IF NOT EXISTS index_daily_bar (
+    date        DATE    NOT NULL,      -- 交易日期
+    code        VARCHAR NOT NULL,      -- 指数代码，如 sh.000001
+    code_name   VARCHAR,
+    open        DOUBLE,
+    high        DOUBLE,
+    low         DOUBLE,
+    close       DOUBLE,
+    preclose    DOUBLE,
+    volume      BIGINT,
+    amount      DOUBLE,
+    adjustflag  VARCHAR NOT NULL,      -- 指数一般用 '3' 不复权
+    pct_chg     DOUBLE,                -- 涨跌幅 %
+    PRIMARY KEY (date, code, adjustflag)
+);
+"""
+
 
 def _ensure_tables(conn: duckdb.DuckDBPyConnection) -> None:
-    """建立三张核心表（如已存在则跳过）。"""
-    for ddl in (_DDL_STOCK_INFO, _DDL_DAILY_BAR, _DDL_MINUTE_BAR):
+    """建立四张核心表（如已存在则跳过）。"""
+    for ddl in (_DDL_STOCK_INFO, _DDL_DAILY_BAR, _DDL_MINUTE_BAR, _DDL_INDEX_DAILY_BAR):
         conn.execute(ddl)
     logger.debug("数据库表结构已就绪")
 
@@ -250,6 +270,40 @@ def upsert_stock_info(
 
     count = conn.execute("SELECT COUNT(*) FROM stock_info").fetchone()[0] #type: ignore
     logger.info(f"stock_info 刷新完毕，当前 {count} 条")
+    conn.close()
+    return count
+
+
+def upsert_index_info(
+    db_path: str = _DEFAULT_DB_PATH,
+) -> int:
+    """
+    将指数列表写入 stock_info（type='2'），供 get_daily 查找 code_name。
+
+    使用 INSERT OR REPLACE by PRIMARY KEY，不影响已有的股票条目。
+    """
+    logger.info("开始刷新 index_info ...")
+    df = fetch_index_list()
+    if df.empty:
+        logger.warning("index_info: 指数列表为空，跳过")
+        return 0
+
+    rename_map = {
+        "ipoDate": "ipo_date",
+        "outDate": "out_date",
+    }
+    df = df.rename(columns=rename_map)
+    df["ipo_date"] = pd.to_datetime(df.get("ipo_date", pd.NaT), errors="coerce").dt.date  # type: ignore
+    df["out_date"] = pd.to_datetime(df["out_date"], errors="coerce").dt.date  # type: ignore
+    df["updated_at"] = pd.to_datetime(datetime.now(), errors="coerce")
+
+    conn = get_connection(db_path)
+    # 只删除旧指数条目，保留股票条目
+    conn.execute("DELETE FROM stock_info WHERE type = '2'")
+    conn.execute("INSERT INTO stock_info SELECT * FROM df")
+
+    count = conn.execute("SELECT COUNT(*) FROM stock_info WHERE type = '2'").fetchone()[0]  # type: ignore
+    logger.info(f"index_info 刷新完毕，当前 {count} 只指数")
     conn.close()
     return count
 
@@ -390,7 +444,10 @@ def get_daily(
     """ 
     stk_info = get_stock_info(code)
     conn = get_read_connection(db_path)
-    code_name = stk_info['code_name'].values[0]
+    if stk_info.empty:
+        code_name = code  # 指数等可能不在 stock_info，用 code 兜底
+    else:
+        code_name = stk_info['code_name'].values[0]
 
     def _query_local() -> pd.DataFrame:
         return conn.execute(
@@ -557,6 +614,108 @@ def query_daily(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# ── CRUD：index_daily_bar ────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _normalize_index_daily_df(df: pd.DataFrame) -> pd.DataFrame:
+    """将 data_tools.fetch_index_daily 返回的 DataFrame 对齐到 index_daily_bar 表结构。"""
+    rename_map = {
+        "pctChg": "pct_chg",
+    }
+    df = df.rename(columns=rename_map)
+
+    numeric_cols = ["open", "high", "low", "close", "preclose", "volume", "amount", "pct_chg"]
+    for col in numeric_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    if "volume" in df.columns:
+        df["volume"] = df["volume"].astype("Int64")
+
+    if "date" in df.columns:
+        df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.date
+
+    return df
+
+
+def insert_index_daily(
+    df: pd.DataFrame,
+    db_path: str = _DEFAULT_DB_PATH,
+) -> int:
+    """
+    将指数日线 DataFrame 写入 index_daily_bar（UPSERT：主键冲突则覆盖）。
+
+    参数:
+        df:      data_tools.fetch_index_daily 返回的 DataFrame
+        db_path: 数据库路径
+
+    返回:
+        实际写入（含覆盖）条数
+    """
+    if df.empty:
+        logger.warning("insert_index_daily: 传入 DataFrame 为空，跳过")
+        return 0
+
+    df = _normalize_index_daily_df(df.copy())
+    conn = get_connection(db_path)
+
+    total = 0
+    for start in range(0, len(df), _CHUNK_SIZE):
+        chunk = df.iloc[start: start + _CHUNK_SIZE]
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO index_daily_bar
+            SELECT
+                date, code, code_name,
+                open, high, low, close, preclose,
+                volume, amount, adjustflag, pct_chg
+            FROM chunk
+            """
+        )
+        total += len(chunk)
+        logger.debug(f"insert_index_daily: 已写入 {total}/{len(df)} 条")
+
+    logger.info(f"insert_index_daily: 共写入 {total} 条指数日线数据")
+    conn.close()
+    return total
+
+
+def get_index_daily(
+    code: str,
+    start_date: str,
+    end_date: str,
+    adjustflag: str = "3",
+    db_path: str = _DEFAULT_DB_PATH,
+) -> pd.DataFrame:
+    """
+    查询指数日线数据（纯读，不带透明补拉，指数靠 daemon 定时拉取）。
+
+    参数:
+        code:        指数代码，如 ``'sh.000001'``
+        start_date:  起始日期，格式 ``'YYYY-MM-DD'``
+        end_date:    截止日期，格式 ``'YYYY-MM-DD'``
+        adjustflag:  复权方式（指数一般用 '3' 不复权）
+        db_path:     数据库路径
+
+    返回:
+        pd.DataFrame，列结构同 index_daily_bar 表
+    """
+    conn = get_read_connection(db_path)
+    res = conn.execute(
+        """
+        SELECT * FROM index_daily_bar
+        WHERE code = ?
+          AND adjustflag = ?
+          AND date BETWEEN ? AND ?
+        ORDER BY date
+        """,
+        [code, adjustflag, start_date, end_date],
+    ).df()
+    conn.close()
+    return res
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # ── CRUD：minute_bar ──────────────────────────────────────────────────────────
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -638,7 +797,10 @@ def get_minute(
     """
     conn = get_connection(db_path)
     stk_info = get_stock_info(code)
-    code_name = stk_info['code_name'].values[0]
+    if stk_info.empty:
+        code_name = code  # 兜底
+    else:
+        code_name = stk_info['code_name'].values[0]
     def _query_local() -> pd.DataFrame:
         return conn.execute(
             """

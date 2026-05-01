@@ -39,6 +39,18 @@ DAILY_FIELDS = (
     "pctChg,isST,peTTM,psTTM,pcfNcfTTM,pbMRQ"
 )
 
+# 指数日线请求字段（指数无 turn/tradestatus/isST/估值字段，但有 pctChg）
+INDEX_DAILY_FIELDS = (
+    "date,code,open,high,low,close,preclose,"
+    "volume,amount,adjustflag,pctChg"
+)
+
+# 指数日线标准列顺序（含 code_name，由 fetch_index_daily 注入）
+INDEX_DAILY_COLUMNS = [
+    "date", "code", "code_name", "open", "high", "low", "close", "preclose",
+    "volume", "amount", "adjustflag", "pctChg",
+]
+
 # 分钟线请求字段
 MINUTE_FIELDS = "date,time,code,open,high,low,close,volume,amount,adjustflag"
 
@@ -175,6 +187,148 @@ def fetch_stock_list() -> pd.DataFrame:
 
     logger.info(f"A 股股票列表获取完毕，共 {len(df)} 只在市股票")
     return df
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 公开接口 1b：获取指数列表
+# ─────────────────────────────────────────────────────────────────────────────
+
+def fetch_index_list() -> pd.DataFrame:
+    """
+    查询 BaoStock 全市场指数列表。
+
+    功能:
+        - 调用 ``bs.query_stock_basic()`` 获取所有证券
+        - 只保留类型 type == '2'（指数）
+        - 过滤已退市（outDate != ''）的指数
+
+    返回:
+        pd.DataFrame，结构同 fetch_stock_list()
+    """
+    logger.info("开始获取指数列表 ...")
+
+    with baostock_session():
+        rs = bs.query_stock_basic()
+        if rs.error_code != "0":
+            raise RuntimeError(
+                f"query_stock_basic 失败: [{rs.error_code}] {rs.error_msg}"
+            )
+
+        rows = []
+        while rs.next():
+            rows.append(rs.get_row_data())
+
+    if not rows:
+        logger.warning("query_stock_basic 返回空结果")
+        return pd.DataFrame()
+
+    df = pd.DataFrame(rows, columns=rs.fields)
+    df = df[(df["type"] == "2") & (df["outDate"] == "")].copy()
+    df = df.reset_index(drop=True)
+
+    logger.info(f"指数列表获取完毕，共 {len(df)} 只指数")
+    return df
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 公开接口 2b：批量拉取指数日线
+# ─────────────────────────────────────────────────────────────────────────────
+
+def fetch_index_daily(
+    index_list: pd.DataFrame,
+    start_date: str,
+    end_date: str,
+    adjustflag: str = "3",
+) -> pd.DataFrame:
+    """
+    批量拉取多只指数的日线数据。
+
+    与 fetch_daily 类似，但使用 INDEX_DAILY_FIELDS，
+    缺失字段填充空字符串以对齐 DAILY_COLUMNS 结构。
+
+    参数:
+        index_list:  指数列表 DataFrame（至少包含 ``code`` 和 ``code_name`` 列）
+        start_date:  起始日期
+        end_date:    截止日期
+        adjustflag:  复权方式（指数一般用 '3' 不复权）
+
+    返回:
+        pd.DataFrame，列结构参见 INDEX_DAILY_COLUMNS
+    """
+    total_indices = len(index_list)
+    logger.info(
+        f"开始批量拉取指数日线: {total_indices} 只指数 "
+        f"[{start_date} ~ {end_date}]  adjustflag={adjustflag}"
+    )
+
+    total_list: list[pd.DataFrame] = []
+    cache_rows: list[list] = []
+    flush_size = 10000
+
+    success_count = 0
+    fail_count = 0
+
+    with baostock_session():
+        for idx, row in index_list.iterrows():
+            code: str = row["code"]
+            code_name: str = row.get("code_name", "")
+
+            rs = _query_with_retry(
+                query_fn=lambda: bs.query_history_k_data_plus(
+                    code, INDEX_DAILY_FIELDS,
+                    start_date=start_date, end_date=end_date,
+                    frequency="d", adjustflag=adjustflag,
+                ),
+                code=code,
+                max_retries=2,
+            )
+
+            if rs is None:
+                fail_count += 1
+                continue
+
+            while rs.next():  # type: ignore
+                raw = rs.get_row_data()  # type: ignore
+                # raw: date, code, open, high, low, close, preclose,
+                #       volume, amount, adjustflag, pctChg
+                aligned = [
+                    raw[0],   # date
+                    raw[1],   # code
+                    code_name,  # code_name
+                    raw[2],   # open
+                    raw[3],   # high
+                    raw[4],   # low
+                    raw[5],   # close
+                    raw[6],   # preclose
+                    raw[7],   # volume
+                    raw[8],   # amount
+                    raw[9],   # adjustflag
+                    raw[10],  # pctChg
+                ]
+                cache_rows.append(aligned)
+
+                if len(cache_rows) >= flush_size:
+                    total_list.append(
+                        pd.DataFrame(cache_rows, columns=INDEX_DAILY_COLUMNS)
+                    )
+                    cache_rows = []
+
+            success_count += 1
+            logger.debug(f"  [{idx+1}/{total_indices}] {code} {code_name} 完成")
+
+    if cache_rows:
+        total_list.append(pd.DataFrame(cache_rows, columns=INDEX_DAILY_COLUMNS))
+
+    if not total_list:
+        logger.warning("fetch_index_daily: 未获取到任何数据")
+        return pd.DataFrame(columns=INDEX_DAILY_COLUMNS)
+
+    result = pd.concat(total_list, axis=0, ignore_index=True, copy=False)  # type: ignore
+    logger.info(
+        f"fetch_index_daily 完成: 成功 {success_count} 只，失败 {fail_count} 只，"
+        f"共 {len(result)} 条记录"
+    )
+    return result
 
 
 # ─────────────────────────────────────────────────────────────────────────────

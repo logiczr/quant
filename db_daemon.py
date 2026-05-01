@@ -294,11 +294,16 @@ def task_refresh_stock_info() -> dict:
 # ── 17:00 收盘批次拉取 ──
 
 def task_post_market_fetch() -> dict:
-    """拉今天的全市场日线数据，入库。"""
+    """拉今天的全市场日线数据（不含指数，指数由 task_fetch_index_daily 单独拉取）。"""
     logger.info("收盘拉取开始 ...")
 
     today = datetime.today().strftime("%Y-%m-%d")
-    stocks = dt.get_stock_info()[["code", "code_name"]]
+    all_info = dt.get_stock_info()
+    # 只拉股票（type != '2'），指数由独立任务处理
+    if "type" in all_info.columns:
+        stocks = all_info[all_info["type"] != "2"][["code", "code_name"]]
+    else:
+        stocks = all_info[["code", "code_name"]]
     total = len(stocks)
     logger.info(f"共 {total} 只股票，拉取 {today} 日线")
 
@@ -321,6 +326,53 @@ def task_post_market_fetch() -> dict:
     return result
 
 
+# ── 17:30 指数日线拉取 ──
+
+# 需要拉取的核心指数
+CORE_INDICES = {
+    "sh.000001": "上证指数",
+    "sz.399001": "深证成指",
+    "sz.399006": "创业板指",
+}
+
+
+def task_fetch_index_daily() -> dict:
+    """拉取核心指数日线数据，入库。"""
+    from data_tools import fetch_index_daily
+    logger.info("指数日线拉取开始 ...")
+
+    today = datetime.today().strftime("%Y-%m-%d")
+    index_list = pd.DataFrame([
+        {"code": code, "code_name": name} for code, name in CORE_INDICES.items()
+    ])
+
+    try:
+        fetched = fetch_index_daily(
+            index_list=index_list,
+            start_date=today,
+            end_date=today,
+            adjustflag="3",
+        )
+    except Exception as e:
+        logger.error(f"指数日线拉取失败: {e}")
+        return {"status": "FAILED", "error": str(e)}
+
+    if not fetched.empty:
+        try:
+            dt.insert_index_daily(fetched)
+            logger.info(f"写入 {len(fetched)} 条指数日线数据")
+        except Exception as e:
+            logger.error(f"指数日线写入失败: {e}")
+            return {"status": "FAILED", "error": str(e)}
+
+    return {
+        "status": "DONE",
+        "date": today,
+        "index_count": len(CORE_INDICES),
+        "rows": len(fetched),
+    }
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # 初始化：创建 TaskManager + 注册定时任务 + FastAPI
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -336,8 +388,9 @@ async def lifespan(app):
     tm = TaskManager()
     tm.schedule("refresh_stock_info", task_refresh_stock_info, "08:30")
     tm.schedule("post_market_fetch", task_post_market_fetch, "17:00")
+    tm.schedule("fetch_index_daily", task_fetch_index_daily, "17:30")
     tm.start()
-    logger.info("[Daemon] TaskManager 已启动，2 个定时任务已注册")
+    logger.info("[Daemon] TaskManager 已启动，3 个定时任务已注册")
     yield
     # ── shutdown ──
     if tm:
