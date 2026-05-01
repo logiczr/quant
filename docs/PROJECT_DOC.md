@@ -340,26 +340,7 @@ def 策略名(date: str, 可选参数: 类型 = 默认值, ...) -> pd.DataFrame:
 
 ---
 
-### 3.5 scheduler.py — 旧版调度器
-
-**职责**：基于 APScheduler 的定时任务调度器（已被 `db_daemon.py` 的 TaskManager 替代，保留备用）。
-
-#### 与 db_daemon.py 的区别
-
-| 对比项 | scheduler.py | db_daemon.py |
-|--------|-------------|-------------|
-| 调度器 | `UpdaterScheduler` 类 | `TaskManager` 类 + FastAPI |
-| HTTP API | ❌ 无 | ✅ 6 个接口 |
-| 前端交互 | ❌ 无 | ✅ daemon_client（支持 params 传参） |
-| 重试机制 | ✅ 3轮（5/10/15分钟） | ❌ 无（单次执行） |
-| 收盘拉取时间 | 18:00 | 17:00（股票）/ 17:30（指数） |
-| 状态 | 保留备用 | **当前使用** |
-
-**依赖**：apscheduler, duckdb_tools, data_tools
-
----
-
-### 3.6 db_daemon.py — 守护进程
+### 3.5 db_daemon.py — 守护进程
 
 **职责**：后台执行定时任务 + 提供 FastAPI HTTP 接口。使用 lifespan 上下文管理器管理 TaskManager 生命周期。
 
@@ -435,7 +416,7 @@ app = FastAPI(title="Stock DB Daemon", lifespan=lifespan)
 
 ---
 
-### 3.7 daemon_client.py — HTTP 客户端
+### 3.6 daemon_client.py — HTTP 客户端
 
 **职责**：Streamlit 侧通过 HTTP 与守护进程通信。
 
@@ -458,7 +439,7 @@ TIMEOUT = 3
 
 ---
 
-### 3.8 streamlit_app.py — 前端
+### 3.7 streamlit_app.py — 前端
 
 **职责**：6 页面看板，通过 daemon_client 与守护进程通信，直接调用 duckdb_tools/index_tools/strategy 获取数据。
 
@@ -488,7 +469,7 @@ TIMEOUT = 3
 
 ---
 
-### 3.9 stra.py — 实验脚本
+### 3.8 stra.py — 实验脚本
 
 **职责**：市值计算实验代码，不参与主流程。
 
@@ -531,7 +512,7 @@ TIMEOUT = 3
 |----|------|------|
 | 数据层 | `data_tools` → `duckdb_tools` → `index_tools` | 拉取 → 存储 → 指标计算 |
 | 策略层 | `strategy.py`（注册器 + 计算函数 + 引擎） ← JSON 策略定义 | 单模块包含注册/计算/查询 |
-| 调度层 | `db_daemon` / `scheduler` | 守护进程（当前，3 个定时任务） / 旧版调度器（备用） |
+| 调度层 | `db_daemon` | 守护进程（3 个定时任务） |
 | 展示层 | `daemon_client` + `streamlit_app` | HTTP 客户端 + 前端 |
 | 回测层 | `backtest_engine`（设计中） | 详见 [BACKTEST_DESIGN.md](BACKTEST_DESIGN.md) |
 
