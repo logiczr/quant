@@ -211,12 +211,12 @@ class TaskManager:
             })
         return jobs
 
-    def run_now(self, task_id: str) -> bool:
-        """手动触发已注册的任务。"""
+    def run_now(self, task_id: str, **kwargs) -> bool:
+        """手动触发已注册的任务，可传 kwargs。"""
         fn = self._task_map.get(task_id)
         if fn is None:
             return False
-        return self.submit(task_id, fn)
+        return self.submit(task_id, fn, **kwargs)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -281,9 +281,10 @@ def _batch_fetch_and_save(
 def task_refresh_stock_info() -> dict:
     logger.info("开始刷新 stock_info ...")
     try:
-        count = dt.upsert_stock_info()
-        result = {"stock_count": count, "status": "DONE"}
-        logger.info(f"stock_info 刷新完毕，{count} 只股票")
+        stock_count = dt.upsert_stock_info()
+        index_count = dt.upsert_index_info()
+        result = {"stock_count": stock_count, "index_count": index_count, "status": "DONE"}
+        logger.info(f"stock_info 刷新完毕，{stock_count} 只股票 + {index_count} 只指数")
     except Exception as e:
         result = {"status": "FAILED", "error": str(e)}
         logger.error(f"stock_info 刷新失败: {e}")
@@ -293,11 +294,17 @@ def task_refresh_stock_info() -> dict:
 
 # ── 17:00 收盘批次拉取 ──
 
-def task_post_market_fetch() -> dict:
-    """拉今天的全市场日线数据（不含指数，指数由 task_fetch_index_daily 单独拉取）。"""
+def task_post_market_fetch(
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> dict:
+    """拉取全市场股票日线数据（不含指数，指数由 task_fetch_index_daily 单独拉取）。"""
     logger.info("收盘拉取开始 ...")
 
     today = datetime.today().strftime("%Y-%m-%d")
+    start_date = start_date or today
+    end_date = end_date or today
+
     all_info = dt.get_stock_info()
     # 只拉股票（type != '2'），指数由独立任务处理
     if "type" in all_info.columns:
@@ -305,9 +312,9 @@ def task_post_market_fetch() -> dict:
     else:
         stocks = all_info[["code", "code_name"]]
     total = len(stocks)
-    logger.info(f"共 {total} 只股票，拉取 {today} 日线")
+    logger.info(f"共 {total} 只股票，拉取 [{start_date} ~ {end_date}] 日线")
 
-    fetched = _batch_fetch_and_save(stocks, start_date=today, end_date=today)
+    fetched = _batch_fetch_and_save(stocks, start_date=start_date, end_date=end_date)
 
     fetched_codes = set(fetched["code"].unique()) if not fetched.empty else set()
     success_count = len(fetched_codes)
@@ -315,7 +322,8 @@ def task_post_market_fetch() -> dict:
 
     result = {
         "status": "DONE" if not failed_codes else "PARTIAL",
-        "date": today,
+        "start_date": start_date,
+        "end_date": end_date,
         "stock_count": total,
         "success_count": success_count,
         "failed_codes": failed_codes,
@@ -328,29 +336,32 @@ def task_post_market_fetch() -> dict:
 
 # ── 17:30 指数日线拉取 ──
 
-# 需要拉取的核心指数
-CORE_INDICES = {
-    "sh.000001": "上证指数",
-    "sz.399001": "深证成指",
-    "sz.399006": "创业板指",
-}
-
-
-def task_fetch_index_daily() -> dict:
-    """拉取核心指数日线数据，入库。"""
-    from data_tools import fetch_index_daily
+def task_fetch_index_daily(
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> dict:
+    """拉取全市场指数日线数据，入库。"""
+    from data_tools import fetch_index_daily, fetch_index_list
     logger.info("指数日线拉取开始 ...")
 
     today = datetime.today().strftime("%Y-%m-%d")
-    index_list = pd.DataFrame([
-        {"code": code, "code_name": name} for code, name in CORE_INDICES.items()
-    ])
+    start_date = start_date or today
+    end_date = end_date or today
+
+
+    # 从 BaoStock 拉取全市场指数列表
+    index_list = fetch_index_list()
+    if index_list.empty:
+        logger.warning("指数列表为空，跳过拉取")
+        return {"status": "SKIPPED", "reason": "指数列表为空"}
+
+    logger.info(f"共 {len(index_list)} 只指数，拉取 [{start_date} ~ {end_date}] 日线")
 
     try:
         fetched = fetch_index_daily(
             index_list=index_list,
-            start_date=today,
-            end_date=today,
+            start_date=start_date,
+            end_date=end_date,
             adjustflag="3",
         )
     except Exception as e:
@@ -367,8 +378,9 @@ def task_fetch_index_daily() -> dict:
 
     return {
         "status": "DONE",
-        "date": today,
-        "index_count": len(CORE_INDICES),
+        "start_date": start_date,
+        "end_date": end_date,
+        "index_count": len(index_list),
         "rows": len(fetched),
     }
 
@@ -416,8 +428,8 @@ def get_jobs():
 
 
 @app.post("/run_now/{task_id}")
-def run_now(task_id: str):
-    ok = tm.run_now(task_id)
+def run_now(task_id: str, params: dict | None = None):
+    ok = tm.run_now(task_id, **(params or {}))
     if not ok:
         raise HTTPException(status_code=409, detail=f"任务 {task_id} 不存在或已在运行")
     return {"success": True, "task_id": task_id}

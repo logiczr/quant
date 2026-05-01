@@ -314,7 +314,7 @@ def fetch_index_daily(
                     cache_rows = []
 
             success_count += 1
-            logger.debug(f"  [{idx+1}/{total_indices}] {code} {code_name} 完成")
+            logger.info(f"  [{idx+1}/{total_indices}] {code} {code_name} 完成")
 
     if cache_rows:
         total_list.append(pd.DataFrame(cache_rows, columns=INDEX_DAILY_COLUMNS))

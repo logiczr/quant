@@ -41,10 +41,14 @@ def get_jobs() -> list:
         return []
 
 
-def run_now(task_id: str) -> dict:
-    """手动触发指定任务。"""
+def run_now(task_id: str, params: dict | None = None) -> dict:
+    """手动触发指定任务，可传 params 字典作为任务函数的 kwargs。"""
     try:
-        resp = requests.post(f"{DAEMON_URL}/run_now/{task_id}", timeout=TIMEOUT)
+        resp = requests.post(
+            f"{DAEMON_URL}/run_now/{task_id}",
+            json=params,
+            timeout=TIMEOUT,
+        )
         return resp.json()
     except Exception as e:
         logger.warning(f"[Client] 触发任务失败: {task_id} - {e}")

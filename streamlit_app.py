@@ -49,64 +49,56 @@ except Exception as e:
 # ─── 主导航 ───
 page = st.sidebar.radio(
     "功能",
-    ["📊 大盘概览", "🔍 个股查询", "📋 股票列表","📈 因子分析","🔧 数据库维护"],
+    ["📊 大盘概览", "🔍 个股查询", "📋 股票列表", "📑 指数列表","📈 因子分析","🔧 数据库维护"],
 )
 
 # ─── 1. 大盘概览 ───
 if page == "📊 大盘概览":
     st.title("大盘概览")
 
+    # ── 指数代码 → 名称映射 ──
+    INDEX_NAMES = {
+        "sh.000001": "上证指数",
+        "sz.399001": "深证成指",
+        "sz.399006": "创业板指",
+    }
+    INDEX_CODES_ORDER = ["sh.000001", "sz.399001", "sz.399006"]
+
+    overview = dt.get_market_overview()
+    latest_date = overview["date"]
+    indices = overview["indices"]
+    pct = overview["pct_series"]
+
+    if latest_date is None:
+        st.warning("暂无行情数据，请先在「数据库维护」中拉取日线数据")
+        st.stop()
+
     # ── 指数卡片 ──
-    INDEX_CODES = {
-        "上证指数": "sh.000001",
-        "深证成指": "sz.399001",
-        "创业板指": "sz.399006",
-    }
-
-    # TODO: 后端接好后替换为 DuckDB 直读
-    MOCK_INDEX_DATA = {
-        "上证指数": {"close": 3245.68, "preclose": 3217.12, "amount": 4231e8},
-        "深证成指": {"close": 10876.32, "preclose": 10918.47, "amount": 5128e8},
-        "创业板指": {"close": 2134.56, "preclose": 2119.33, "amount": 2345e8},
-    }
-    MOCK_LATEST_DATE = "2026-04-30"
-
-    # 三栏指数卡片
     cols = st.columns(3)
-    for idx, (name, code) in enumerate(INDEX_CODES.items()):
+    for idx, code in enumerate(INDEX_CODES_ORDER):
         with cols[idx]:
-            d = MOCK_INDEX_DATA[name]
-            close_val = d["close"]
-            preclose = d["preclose"]
-            delta_val = close_val - preclose
-            pct = delta_val / preclose * 100
-            amount_str = f"{d['amount'] / 1e8:.0f}亿"
-            st.metric(
-                label=f"{name}  `{code}`",
-                value=f"{close_val:,.2f}",
-                delta=f"{delta_val:+,.2f}  ({pct:+.2f}%)",
-            )
-            st.caption(f"成交额: {amount_str}")
+            d = indices.get(code)
+            name = INDEX_NAMES[code]
+            if d:
+                close_val = d["close"]
+                preclose = d["preclose"]
+                delta_val = close_val - preclose
+                pct_val = d["pct_chg"]
+                amount_str = f"{d['amount'] / 1e8:.0f}亿" if d["amount"] else "—"
+                st.metric(
+                    label=f"{name}  `{code}`",
+                    value=f"{close_val:,.2f}",
+                    delta=f"{delta_val:+,.2f}  ({pct_val:+.2f}%)",
+                )
+                st.caption(f"成交额: {amount_str}")
+            else:
+                st.metric(label=f"{name}  `{code}`", value="—")
 
     st.divider()
 
     # ── 涨跌分布 ──
-    # TODO: 后端接好后替换为 DuckDB 直读
-    st.subheader(f"涨跌分布  ({MOCK_LATEST_DATE})")
+    st.subheader(f"涨跌分布  ({latest_date})")
 
-    # 模拟全市场涨跌幅分布
-    np.random.seed(42)
-    _n = 5200
-    _pct = np.concatenate([
-        np.random.uniform(0, 5, 1845),       # 涨0~5%
-        np.random.uniform(-5, 0, 1567),      # 跌0~5%
-        np.zeros(312),                         # 平盘
-        np.random.uniform(5, 9.9, 89),        # 涨>5%
-        np.random.uniform(-9.9, -5, 98),      # 跌>5%
-        np.random.uniform(9.9, 10.1, 12),     # 涨停
-        np.random.uniform(-10.1, -9.9, 3),    # 跌停
-    ])
-    pct = pd.Series(_pct)
     total = len(pct)
 
     # ── 分区统计 ──
@@ -146,17 +138,17 @@ if page == "📊 大盘概览":
         )
         fig_donut.update_traces(
             textinfo="label+value",
-            textfont_size=18,
+            textfont_size=12,
             hovertemplate="%{label}: %{value}只 (%{percent})<extra></extra>",
         )
         fig_donut.update_layout(
             showlegend=True,
-            height=420,
+            height=425,
             margin=dict(t=10, b=10, l=10, r=10),
             annotations=[dict(
                 text=f"{total}<br>只",
                 x=0.5, y=0.5,
-                font_size=20,
+                font_size=15,
                 showarrow=False,
             )],
         )
@@ -288,6 +280,41 @@ elif page == "📋 股票列表":
 
     st.dataframe(df, use_container_width=True, height=600)
 
+# ─── 4. 指数列表 ───
+elif page == "📑 指数列表":
+    st.title("指数列表")
+
+    @st.cache_data
+    def load_indices():
+        all_info = dt.get_stock_info()
+        if "type" in all_info.columns:
+            return all_info[all_info["type"] == "2"].reset_index(drop=True)
+        return pd.DataFrame()
+
+    if st.button("更新", type="primary"):
+        if dc.is_alive():
+            result = dc.run_now("refresh_stock_info")
+            if result.get("success"):
+                st.toast("✅ 列表刷新已触发，稍后刷新页面")
+                load_indices.clear()
+            else:
+                st.toast(f"❌ 触发失败：{result.get('detail', result.get('error', '未知'))}")
+        else:
+            st.warning("守护进程离线，无法触发刷新")
+
+    df = load_indices()
+    st.caption(f"共 {len(df)} 只指数")
+
+    # 搜索过滤
+    search = st.text_input("搜索代码或名称")
+    if search:
+        df = df[
+            df["code"].str.contains(search, na=False) |
+            df["code_name"].str.contains(search, na=False)
+        ]
+
+    st.dataframe(df, use_container_width=True, height=600)
+
 elif page == "🔧 数据库维护":
     pass
     st.title("数据库维护")
@@ -312,16 +339,34 @@ elif page == "🔧 数据库维护":
 
 
     st.subheader("手动触发")
+
+    # ── 日期选择 ──
+    date_col1, date_col2 = st.columns(2)
+    with date_col1:
+        fetch_start = st.date_input("起始日期", pd.Timestamp.today(), key="fetch_start")
+    with date_col2:
+        fetch_end = st.date_input("截止日期", pd.Timestamp.today(), key="fetch_end")
+
     task_options = {
         "refresh_stock_info": "🔄 刷新股票列表 (08:30)",
-        "post_market_fetch": "📊 收盘批次拉取 (18:00)",
+        "post_market_fetch": "📊 股票日线拉取",
+        "fetch_index_daily": "📈 指数日线拉取",
     }
+
+    # 需要传日期的任务
+    DATE_TASKS = {"post_market_fetch", "fetch_index_daily"}
 
     cols = st.columns(len(task_options))
     for idx, (task_id, label) in enumerate(task_options.items()):
         with cols[idx]:
             if st.button(label, key=f"btn_{task_id}"):
-                result = dc.run_now(task_id)
+                params = {}
+                if task_id in DATE_TASKS:
+                    params = {
+                        "start_date": fetch_start.strftime("%Y-%m-%d"),
+                        "end_date": fetch_end.strftime("%Y-%m-%d"),
+                    }
+                result = dc.run_now(task_id, params=params or None)
                 if result.get("success"):
                     st.toast(f"✅ {task_id} 已触发")
                 else:

@@ -55,7 +55,6 @@ _DEFAULT_DB_PATH = os.path.join(
 
 def _open(db_path: str, readonly: bool = False) -> duckdb.DuckDBPyConnection:
     """打开 DuckDB 连接（短连接，调用方负责关闭）。"""
-    global _tables_initialized
     conn = duckdb.connect(db_path, read_only=False)
     return conn
 
@@ -263,6 +262,7 @@ def upsert_stock_info(
     df["updated_at"] = pd.to_datetime(datetime.now(), errors="coerce")
 
     conn = get_connection(db_path)
+    conn.execute(_DDL_STOCK_INFO)
 
     # 使用 DuckDB INSERT OR REPLACE（UPSERT by PRIMARY KEY）
     conn.execute("DELETE FROM stock_info")
@@ -298,6 +298,7 @@ def upsert_index_info(
     df["updated_at"] = pd.to_datetime(datetime.now(), errors="coerce")
 
     conn = get_connection(db_path)
+    conn.execute(_DDL_STOCK_INFO)
     # 只删除旧指数条目，保留股票条目
     conn.execute("DELETE FROM stock_info WHERE type = '2'")
     conn.execute("INSERT INTO stock_info SELECT * FROM df")
@@ -383,6 +384,7 @@ def insert_daily(
 
     df = _normalize_daily_df(df.copy())
     conn = get_connection(db_path)
+    conn.execute(_DDL_DAILY_BAR)
 
     total = 0
     for start in range(0, len(df), _CHUNK_SIZE):
@@ -658,6 +660,7 @@ def insert_index_daily(
 
     df = _normalize_index_daily_df(df.copy())
     conn = get_connection(db_path)
+    conn.execute(_DDL_INDEX_DAILY_BAR)
 
     total = 0
     for start in range(0, len(df), _CHUNK_SIZE):
@@ -741,6 +744,7 @@ def insert_minute(
 
     df = _normalize_minute_df(df.copy(), frequency)
     conn = get_connection(db_path)
+    conn.execute(_DDL_MINUTE_BAR)
 
     total = 0
     for start in range(0, len(df), _CHUNK_SIZE):
@@ -906,6 +910,102 @@ def query_minute(
     """
     conn = get_connection(db_path)
     return conn.execute(sql, params or []).df()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ── 大盘概览 ────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+
+CORE_INDICES = ["sh.000001", "sz.399001", "sz.399006"]
+
+
+def get_market_overview(db_path: str = _DEFAULT_DB_PATH) -> dict:
+    """
+    获取大盘概览数据（供 Streamlit 大盘概览页调用）。
+
+    自动检测最新交易日（取 daily_bar 和 index_daily_bar 中的较小值），
+    返回三大指数行情 + 全市场涨跌幅分布。
+
+    返回:
+        dict，结构::
+
+            {
+                "date": "2026-04-30",       # 最新交易日
+                "indices": {
+                    "sh.000001": {"code_name": "上证指数", "close": 3245.68,
+                                  "preclose": 3217.12, "amount": 4231e8, "pct_chg": 0.89},
+                    ...
+                },
+                "pct_series": pd.Series([...]),   # 全市场 pct_chg
+            }
+
+        若数据库无数据，返回 ``{"date": None, "indices": {}, "pct_series": pd.Series()}``
+    """
+    empty_result = {"date": None, "indices": {}, "pct_series": pd.Series(dtype=float)}
+
+    conn = get_read_connection(db_path)
+
+    # ── 1. 确定最新交易日 ──
+    try:
+        daily_max = conn.execute("SELECT MAX(date) FROM daily_bar").fetchone()[0]
+    except Exception:
+        daily_max = None
+    try:
+        index_max = conn.execute("SELECT MAX(date) FROM index_daily_bar").fetchone()[0]
+    except Exception:
+        index_max = None
+
+    if daily_max is None and index_max is None:
+        conn.close()
+        return empty_result
+
+    # 取两边都有数据的最近日期：用较小值保证两边数据齐全
+    dates = [d for d in [daily_max, index_max] if d is not None]
+    latest_date = min(dates) if dates else None
+
+    if latest_date is None:
+        conn.close()
+        return empty_result
+
+    latest_str = str(latest_date)
+
+    # ── 2. 三大指数行情 ──
+    indices = {}
+    for code in CORE_INDICES:
+        row = conn.execute(
+            """
+            SELECT code_name, close, preclose, amount, pct_chg
+            FROM index_daily_bar
+            WHERE code = ? AND date = ? AND adjustflag = '3'
+            """,
+            [code, latest_str],
+        ).fetchone()
+        if row:
+            indices[code] = {
+                "code_name": row[0],
+                "close": row[1],
+                "preclose": row[2],
+                "amount": row[3],
+                "pct_chg": row[4],
+            }
+
+    # ── 3. 全市场涨跌幅 ──
+    pct_df = conn.execute(
+        """
+        SELECT pct_chg FROM daily_bar
+        WHERE date = ? AND adjustflag = '3' AND pct_chg IS NOT NULL
+        """,
+        [latest_str],
+    ).df()
+    pct_series = pct_df["pct_chg"] if not pct_df.empty else pd.Series(dtype=float)
+
+    conn.close()
+
+    return {
+        "date": latest_str,
+        "indices": indices,
+        "pct_series": pct_series,
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -1,8 +1,9 @@
 {
   "status": "DONE",
-  "date": "2026-04-29",
-  "stock_count": 5200,
-  "success_count": 5200,
+  "start_date": "2026-04-30",
+  "end_date": "2026-04-30",
+  "stock_count": 5201,
+  "success_count": 5201,
   "failed_codes": [],
-  "updated": "2026-04-29 19:21:03"
+  "updated": "2026-05-01 20:41:32"
 }
