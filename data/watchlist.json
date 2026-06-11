@@ -1,0 +1,18 @@
+{
+  "SPCX": {
+    "description": "",
+    "created_at": "2026-05-06",
+    "stocks": [
+      {
+        "code": "sz.002149",
+        "note": "",
+        "added_date": "2026-05-06"
+      },
+      {
+        "code": "sz.300136",
+        "note": "",
+        "added_date": "2026-05-06"
+      }
+    ]
+  }
+}

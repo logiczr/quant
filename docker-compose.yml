@@ -1,0 +1,29 @@
+services:
+  daemon:
+    build: .
+    command: python db_daemon.py
+    ports:
+      - "8502:8502"
+    environment:
+      - QUANT_DB_PATH=/quant3/data/stock_data.duckdb
+      # 钉钉推送（不填则不启用通知功能）
+      - DINGTALK_CLIENT_ID=${DINGTALK_CLIENT_ID:-}
+      - DINGTALK_CLIENT_SECRET=${DINGTALK_CLIENT_SECRET:-}
+      - DINGTALK_OPEN_CONVERSATION_ID=${DINGTALK_OPEN_CONVERSATION_ID:-}
+    volumes:
+      - quant3-data:/quant3/data
+    restart: unless-stopped
+
+  streamlit:
+    build: .
+    command: streamlit run streamlit_app.py --server.address 0.0.0.0 --server.port 8501
+    ports:
+      - "8501:8501"
+    environment:
+      - DAEMON_URL=http://daemon:8502
+    depends_on:
+      - daemon
+    restart: unless-stopped
+
+volumes:
+  quant3-data:
